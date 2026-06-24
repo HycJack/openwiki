@@ -29,7 +29,7 @@ openwiki --help
 
 On the first interactive run, OpenWiki asks for an OpenRouter API key, lets you pick a default model, and saves both to `~/.openwiki/.env`. A LangSmith API key can also be provided optionally to enable tracing your OpenWiki runs.
 
-See `examples/openwiki-update.yml` for a GitHub Actions workflow you can copy into a repository for scheduled updates.
+See [`examples/openwiki-update.yml`](./examples/openwiki-update.yml) for a GitHub Actions workflow you can copy into a repository for scheduled updates.
 
 ## Customizing
 
