@@ -1,0 +1,41 @@
+{
+  "name": "tui-coding-agent",
+  "version": "0.1.0",
+  "description": "A plugin-based TUI coding agent",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "tca": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "bundle": "tsc -p tsconfig.json && node --experimental-sea-config sea-config.json && npx postject dist/sea-node.exe NODE_SEA_BLOB dist/sea.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite",
+    "dev": "tsx src/cli.tsx",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src/ --ext .ts,.tsx"
+  },
+  "dependencies": {
+    "@langchain/anthropic": "^1.5.1",
+    "@langchain/core": "^1.2.1",
+    "@langchain/openai": "^1.5.5",
+    "ink": "^5.1.0",
+    "marked": "^18.0.6",
+    "react": "^18.3.1",
+    "typebox": "^1.1.38",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/marked": "^5.0.2",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@typescript-eslint/eslint-plugin": "^8.64.0",
+    "@typescript-eslint/parser": "^8.64.0",
+    "eslint": "^10.7.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
