@@ -6,7 +6,7 @@
  */
 
 import type { Static, TSchema } from "typebox";
-import { StreamEvent } from "./llm";
+import { StreamEvent } from "./llm.js";
 
 // ============================================================================
 // 消息类型
@@ -139,6 +139,7 @@ export interface ModelConfig {
   provider: string;
   apiKey?: string;
   baseURL?: string;
+  contextWindow?: number;
 }
 
 // ============================================================================
@@ -155,7 +156,8 @@ export type AgentEvent =
   | { type: "message_end"; message: AgentMessage }
   | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: unknown }
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; partialResult: unknown }
-  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: unknown; isError: boolean };
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: unknown; isError: boolean }
+  | { type: "notification"; message: string; level: "info" | "warning" | "error" };
 
 // ============================================================================
 // Agent Loop 配置

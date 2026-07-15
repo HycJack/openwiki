@@ -180,11 +180,16 @@ async function streamAssistantResponse(
   signal: AbortSignal | undefined,
   emit: EventSink,
 ): Promise<AssistantMessage> {
-  // 应用上下文变换
-  let messages = context.messages;
+  // 应用上下文变换，并写回 context.messages
   if (config.transformContext) {
-    messages = await config.transformContext(messages, signal);
+    const transformed = await config.transformContext(context.messages, signal);
+    if (transformed !== context.messages) {
+      // replace context.messages 的内容
+      context.messages.length = 0;
+      context.messages.push(...transformed);
+    }
   }
+  const messages = context.messages;
 
   // 转换为 LLM 消息
   const llmMessages = await config.convertToLlm(messages);

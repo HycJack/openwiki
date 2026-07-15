@@ -166,10 +166,23 @@ export class Agent {
   /** 加载消息（替换当前消息列表） */
   loadMessages(messages: AgentMessage[]): void {
     this._messages = messages.slice();
+    this._errorMessage = undefined;
+    this._streamingMessage = undefined;
   }
 
   abort(): void { this.activeRun?.abortController.abort(); }
   waitForIdle(): Promise<void> { return this.activeRun?.promise ?? Promise.resolve(); }
+
+  /** 向 TUI 发送通知消息（通过 listeners 广播 notification 事件）。 */
+  notifyUI(message: string, level: "info" | "warning" | "error" = "info"): void {
+    const event: AgentEvent = { type: "notification", message, level };
+    for (const listener of this.listeners) {
+      const result = listener(event, new AbortController().signal);
+      if (result && typeof result === "object" && "catch" in result) {
+        (result as Promise<void>).catch(() => {});
+      }
+    }
+  }
 
   reset(): void {
     this._messages = [];

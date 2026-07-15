@@ -36,11 +36,18 @@ export interface PluginContext {
   isIdle(): boolean;
   abort(): void;
   getSystemPrompt(): string;
+  /** 获取估算的上下文 token 用量。返回 null 表示无从估算。 */
+  getContextUsage(): { tokens: number; limit: number; percent: number } | null;
+  /** 触发上下文压缩（异步，不阻塞当前流程）。 */
+  compact(options?: { customInstructions?: string }): void;
+  /** 获取当前 agent 的消息数量。 */
+  getMessageCount(): number;
 }
 
 export interface PluginCommandContext extends PluginContext {
   waitForIdle(): Promise<void>;
   sendMessage(content: string): void;
+  notify(message: string, type?: "info" | "warning" | "error"): void;
 }
 
 export interface PluginUIContext {

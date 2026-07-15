@@ -35,6 +35,9 @@ export class PluginRunner {
   private abortFn: () => void = () => {};
   private waitForIdleFn: () => Promise<void> = async () => {};
   private sendMessageFn: (content: string) => void = () => {};
+  private compactFn: (options?: { customInstructions?: string }) => void = () => {};
+  private getContextUsageFn: () => { tokens: number; limit: number; percent: number } | null = () => null;
+  private getMessageCountFn: () => number = () => 0;
 
   constructor(plugins: Plugin[], runtime: PluginRuntime, options: PluginRunnerOptions) {
     this.plugins = plugins;
@@ -56,6 +59,9 @@ export class PluginRunner {
     getAllTools: () => string[];
     setActiveTools: (toolNames: string[]) => void;
     notify: (message: string, type?: "info" | "warning" | "error") => void;
+    compact?: (options?: { customInstructions?: string }) => void;
+    getContextUsage?: () => { tokens: number; limit: number; percent: number } | null;
+    getMessageCount?: () => number;
   }): void {
     this.isIdleFn = actions.isIdle;
     this.abortFn = actions.abort;
@@ -68,6 +74,10 @@ export class PluginRunner {
     this.runtime.getAllTools = actions.getAllTools;
     this.runtime.setActiveTools = actions.setActiveTools;
     this.runtime.notify = actions.notify;
+
+    if (actions.compact) this.compactFn = actions.compact;
+    if (actions.getContextUsage) this.getContextUsageFn = actions.getContextUsage;
+    if (actions.getMessageCount) this.getMessageCountFn = actions.getMessageCount;
   }
 
   hasHandlers(eventType: string): boolean {
@@ -79,16 +89,17 @@ export class PluginRunner {
   }
 
   /**
-   * 分发事件到所有插件。
+   * 分发事件到所有插件，事件处理器接收 (event, context) 两个参数。
    */
   async emit(event: AgentEvent): Promise<void> {
     const eventType = event.type;
+    const ctx = this.createContext();
     for (const plugin of this.plugins) {
       const handlers = plugin.handlers.get(eventType);
       if (!handlers) continue;
       for (const handler of handlers) {
         try {
-          await handler(event);
+          await handler(event, ctx);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.runtime.notify(`Plugin error in ${plugin.name}: ${message}`, "error");
@@ -98,21 +109,49 @@ export class PluginRunner {
   }
 
   /**
-   * 分发自定义事件。
+   * 分发自定义事件，事件处理器接收 (args..., context) 参数。
    */
   async emitCustom(eventType: string, ...args: unknown[]): Promise<void> {
+    const ctx = this.createContext();
     for (const plugin of this.plugins) {
       const handlers = plugin.handlers.get(eventType);
       if (!handlers) continue;
       for (const handler of handlers) {
         try {
-          await handler(...args);
+          await handler(...args, ctx);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.runtime.notify(`Plugin error in ${plugin.name}: ${message}`, "error");
         }
       }
     }
+  }
+
+  /**
+   * 分发 context 事件，允许插件在 LLM 调用前修改消息列表。
+   * 每个插件的处理器可以返回 { messages } 来替换消息列表。
+   */
+  async emitContext(messages: unknown[]): Promise<unknown[]> {
+    const ctx = this.createContext();
+    let currentMessages = structuredClone(messages);
+
+    for (const plugin of this.plugins) {
+      const handlers = plugin.handlers.get("context");
+      if (!handlers || handlers.length === 0) continue;
+      for (const handler of handlers) {
+        try {
+          const result = await handler({ type: "context", messages: currentMessages }, ctx);
+          if (result && typeof result === "object" && "messages" in result && Array.isArray(result.messages)) {
+            currentMessages = result.messages;
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.runtime.notify(`Plugin error in ${plugin.name}: ${message}`, "error");
+        }
+      }
+    }
+
+    return currentMessages;
   }
 
   /**
@@ -149,12 +188,16 @@ export class PluginRunner {
    * 创建插件上下文（用于事件处理）。
    */
   createContext(): PluginContext {
+    const self = this;
     return {
       cwd: this.cwd,
       model: this.model,
       isIdle: () => this.isIdleFn(),
       abort: () => this.abortFn(),
       getSystemPrompt: () => this.systemPrompt,
+      getContextUsage: () => self.getContextUsageFn(),
+      compact: (options) => self.compactFn(options),
+      getMessageCount: () => self.getMessageCountFn(),
     };
   }
 
@@ -166,6 +209,7 @@ export class PluginRunner {
       ...this.createContext(),
       waitForIdle: () => this.waitForIdleFn(),
       sendMessage: (content) => this.sendMessageFn(content),
+      notify: (message, type) => this.runtime.notify(message, type),
     };
   }
 
@@ -191,6 +235,14 @@ export class PluginRunner {
 
   getPluginPaths(): string[] {
     return this.plugins.map((p) => p.path);
+  }
+
+  /**
+   * 重新加载插件列表（替换所有已加载的插件）。
+   * 调用方需要先使用 loadPlugins 或类似方法加载新插件。
+   */
+  reloadPlugins(newPlugins: Plugin[]): void {
+    this.plugins = newPlugins.slice();
   }
 }
 

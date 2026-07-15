@@ -29,11 +29,11 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@types/marked": "^5.0.2",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.17",
     "@typescript-eslint/eslint-plugin": "^8.64.0",
     "@typescript-eslint/parser": "^8.64.0",
+    "esbuild": "^0.28.1",
     "eslint": "^10.7.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"

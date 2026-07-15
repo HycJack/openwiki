@@ -36,6 +36,23 @@ import {
 } from "./session.js";
 import type { AgentMessage, AgentTool, ModelConfig } from "./types.js";
 
+// ============================================================================
+// Token 估算工具函数（与 context-manager-plugin 算法一致）
+// ============================================================================
+
+function estimateTextTokens(text: string): number {
+  let tokens = 0;
+  for (const ch of text) {
+    const code = ch.charCodeAt(0);
+    if (code <= 127) tokens += 0.25;
+    else if (code >= 0x4e00 && code <= 0x9fff) tokens += 1.5;
+    else if (code >= 0x3040 && code <= 0x30ff) tokens += 0.6;
+    else if (code >= 0xac00 && code <= 0xd7af) tokens += 0.6;
+    else tokens += 0.5;
+  }
+  return Math.ceil(tokens);
+}
+
 interface CliArgs {
   model?: string;
   provider?: string;
@@ -224,6 +241,9 @@ async function main(): Promise<void> {
   }
   const allTools = Array.from(toolMap.values());
 
+  // 缓存插件路径供 reload 使用
+  const cachedPluginPaths = pluginPaths.slice();
+
   // 构建系统提示词
   const systemPrompt = buildSystemPrompt({ cwd, tools: allTools });
 
@@ -252,6 +272,13 @@ async function main(): Promise<void> {
     }
   }
 
+  // 创建插件 runner（必须在 Agent 之前，transformContext 闭包需要引用它）
+  const pluginRunner = createPluginRunner(loadResult, pluginRuntime, {
+    cwd,
+    model,
+    systemPrompt,
+  });
+
   // 创建 Agent
   const agent = new Agent({
     initialState: {
@@ -271,16 +298,13 @@ async function main(): Promise<void> {
           }
         }
       : undefined,
+    transformContext: async (messages) => {
+      const result = await pluginRunner.emitContext(messages);
+      return result as AgentMessage[];
+    },
   });
 
-  // 创建插件 runner
-  const pluginRunner = createPluginRunner(loadResult, pluginRuntime, {
-    cwd,
-    model,
-    systemPrompt,
-  });
-
-  // 绑定核心操作到插件 runner
+  // 绑定核心操作到插件 runner（需要 Agent 创建后才能引用 agent）
   pluginRunner.bindCore({
     isIdle: () => !agent.state.isStreaming,
     abort: () => agent.abort(),
@@ -290,7 +314,7 @@ async function main(): Promise<void> {
         console.error("Agent prompt error:", err);
       });
     },
-    getActiveTools: () => allTools.map((t) => t.name),
+    getActiveTools: () => agent.tools.map((t) => t.name),
     getAllTools: () => allTools.map((t) => t.name),
     setActiveTools: (toolNames: string[]) => {
       const filtered = allTools.filter((t) => toolNames.includes(t.name));
@@ -299,6 +323,53 @@ async function main(): Promise<void> {
     notify: (message: string, type?: "info" | "warning" | "error") => {
       const prefix = type === "error" ? "[ERROR]" : type === "warning" ? "[WARN]" : "[INFO]";
       console.log(`${prefix} ${message}`);
+      // 同时通过 agent 的事件系统通知 TUI（如果正在输出到 TUI）
+      agent.notifyUI(message, type);
+    },
+    compact: (options) => {
+      // 暂无内置压缩实现，但插件可以自行通过 API 实现
+      console.log("[INFO] Compaction not yet implemented. Use /new or /clear to reset context.");
+    },
+    getMessageCount: () => agent.state.messages.length,
+    getContextUsage: () => {
+      const msgs = agent.state.messages;
+      if (msgs.length === 0) return null;
+      // 每条消息 ~4 token 开销
+      let tokens = msgs.length * 4;
+      for (const msg of msgs) {
+        if (msg.role === "user" || msg.role === "toolResult") {
+          // UserMessage: content = (TextContent | ImageContent)[]
+          // ToolResultMessage: content = ToolResultContent[], 每个有嵌套 content
+          for (const block of msg.content) {
+            if ("content" in block && Array.isArray(block.content)) {
+              // ToolResultContent: 嵌套的 text 内容
+              for (const inner of block.content) {
+                if (inner.type === "text") tokens += estimateTextTokens(inner.text);
+              }
+            } else if (block.type === "text") {
+              tokens += estimateTextTokens(block.text);
+            }
+          }
+        } else if (msg.role === "assistant") {
+          // AssistantMessage: content = ContentBlock[] (TextContent | ToolCallContent)
+          for (const block of msg.content) {
+            if (block.type === "text") {
+              tokens += estimateTextTokens(block.text);
+            } else if (block.type === "toolCall") {
+              tokens += estimateTextTokens(JSON.stringify(block.arguments));
+            }
+          }
+          // 统计 reasoning
+          if (msg.reasoning) {
+            tokens += estimateTextTokens(msg.reasoning);
+          }
+        }
+      }
+      // 加系统提示词
+      tokens += estimateTextTokens(systemPrompt);
+      const limit = model.contextWindow || 128_000;
+      const percent = Math.min((tokens / limit) * 100, 100);
+      return { tokens: Math.ceil(tokens), limit, percent: Math.round(percent * 10) / 10 };
     },
   });
 
@@ -332,7 +403,9 @@ async function main(): Promise<void> {
     await agent.prompt(args.print);
   } else {
     // 交互模式：启动 TUI
+    const tuiSetMessagesRef: { current?: (messages: AgentMessage[]) => void } = {};
     await renderTUI(agent, pluginRunner, cwd, {
+      onSetInitialMessages: (setter) => { tuiSetMessagesRef.current = setter; },
       sessionId,
       sessions: sessionInfos.map((s) => ({
         id: s.meta.id,
@@ -355,15 +428,42 @@ async function main(): Promise<void> {
           if (target) {
             const msgs = await loadSessionMessages(target.filePath);
             sessionId = resumeId;
-            // 重建 agent 使用新的 session 消息
             agent.reset();
             agent.loadMessages(msgs);
+            // 通知 TUI 显示这些消息
+            tuiSetMessagesRef.current?.(msgs);
           }
         }
       },
       onRenameSession: async (name: string) => {
         if (sessionId) {
           await renameSessionFile(cwd, sessionId, name);
+        }
+      },
+      onReloadPlugins: async () => {
+        if (!agent.state.isStreaming) {
+          const { loadPlugins } = await import("./plugin/loader.js");
+          const newRuntime = { ...pluginRuntime };
+          const newLoadResult = await loadPlugins(cachedPluginPaths, cwd, newRuntime);
+          for (const err of newLoadResult.errors) {
+            console.error(`Plugin load error: ${err.path}: ${err.error}`);
+          }
+          pluginRunner.reloadPlugins(newLoadResult.plugins);
+          // 更新 agent 的工具列表（内置工具 + 新插件工具）
+          const newPluginTools = newLoadResult.plugins.flatMap((p) => Array.from(p.tools.values()));
+          const newToolMap = new Map<string, AgentTool>();
+          for (const tool of allTools) {
+            newToolMap.set(tool.name, tool);
+          }
+          for (const tool of newPluginTools) {
+            if (!newToolMap.has(tool.name)) {
+              newToolMap.set(tool.name, tool);
+            }
+          }
+          agent.tools = Array.from(newToolMap.values());
+          agent.notifyUI(`Reloaded ${newLoadResult.plugins.length} plugins.`, "info");
+        } else {
+          agent.notifyUI("Cannot reload plugins while agent is streaming. Wait for the current turn to finish.", "warning");
         }
       },
     });

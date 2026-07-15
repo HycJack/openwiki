@@ -101,6 +101,26 @@ function createPlugin(pluginPath: string): Plugin {
 }
 
 /**
+ * 确保插件目录的依赖已安装。
+ * 如果存在 package.json 且 node_modules 不存在，自动执行 npm install。
+ */
+async function ensurePluginDeps(dirPath: string): Promise<void> {
+  const pkgPath = path.join(dirPath, "package.json");
+  const nodeModulesPath = path.join(dirPath, "node_modules");
+  if (!fs.existsSync(pkgPath) || fs.existsSync(nodeModulesPath)) return;
+  try {
+    const { execSync } = await import("node:child_process");
+    execSync("npm install --no-audit --no-fund", {
+      cwd: dirPath,
+      stdio: "ignore",
+      timeout: 120_000,
+    });
+  } catch {
+    // 静默失败，后续 import 会报错
+  }
+}
+
+/**
  * 加载单个插件模块。
  */
 export async function loadPlugin(
@@ -111,6 +131,20 @@ export async function loadPlugin(
   try {
     const resolvedPath = path.resolve(cwd, pluginPath);
     const fileUrl = pathToFileURL(resolvedPath).href;
+
+    // 确保插件目录的依赖已安装
+    await ensurePluginDeps(path.dirname(resolvedPath));
+
+    // 确保 .ts 文件可被 import（在 dist/ 模式下需要 tsx）
+    if (resolvedPath.endsWith(".ts") && !process.execArgv.some((a) => a.includes("tsx"))) {
+      try {
+        // tsx 无类型声明文件，动态 import 绕开类型检查
+        // @ts-expect-error - tsx has no types
+        await import("tsx");
+      } catch {
+        // tsx 不可用，继续尝试 import，失败时会被 catch
+      }
+    }
 
     // 动态导入模块
     const module = await import(fileUrl);

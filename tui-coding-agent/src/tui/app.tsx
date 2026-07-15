@@ -13,9 +13,9 @@
  * 注意：Ink 不支持原生 HTML 元素，所有输入通过 useInput hook + useState 处理。
  */
 
-import React, { useEffect, useRef, useState, useCallback, memo } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo, memo } from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
-import { marked, type Token, type Tokens } from "marked";
+import { marked, Token, type Tokens } from "marked";
 import type { Agent } from "../agent.js";
 import type { AgentEvent } from "../types.js";
 import type { AgentMessage, ToolCallContent, TextContent } from "../types.js";
@@ -155,6 +155,9 @@ interface TUIProps {
   onNewSession?: () => Promise<void>;
   onResumeSession?: (sessionId: string) => Promise<void>;
   onRenameSession?: (name: string) => Promise<void>;
+  onNotify?: (message: string, type?: "info" | "warning" | "error") => void;
+  onSetInitialMessages?: (setter: (messages: AgentMessage[]) => void) => void;
+  onReloadPlugins?: () => Promise<void>;
 }
 
 /** 内置命令列表 */
@@ -167,13 +170,29 @@ const BUILTIN_COMMANDS = [
   { name: "quit", description: "Exit the agent" },
 ];
 
-function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSession, onResumeSession, onRenameSession }: TUIProps) {
+function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSession, onResumeSession, onRenameSession, onNotify, onSetInitialMessages, onReloadPlugins }: TUIProps) {
   const { exit } = useApp();
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [input, setInput] = useState("");
   const [cursorPos, setCursorPos] = useState(0);
   const [isStreaming, setIsStreaming] = useState(false);
   const [status, setStatus] = useState<string>("");
+  const [notifications, setNotifications] = useState<Array<{ text: string; type: "info" | "warning" | "error"; id: number }>>([]);
+  const notifIdRef = useRef(0);
+  const setMessagesRef = useRef<(msgs: AgentMessage[]) => void>(() => {});
+  setMessagesRef.current = (msgs: AgentMessage[]) => {
+    const items = msgs.map((m) => messageToItem(m, m.role === "assistant"));
+    setMessages(items);
+  };
+
+  useEffect(() => {
+    if (onSetInitialMessages) {
+      const fn = onSetInitialMessages;
+      fn(setMessagesRef.current);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashFilter, setSlashFilter] = useState("");
   const [selectedCmdIdx, setSelectedCmdIdx] = useState(0);
@@ -181,10 +200,34 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
   const [selectedSessionIdx, setSelectedSessionIdx] = useState(0);
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameInput, setRenameInput] = useState("");
-  // 流式渲染优化：缓存当前流式文本，避免每次 update 重建 MessageItem
-  const streamingTextRef = useRef<string>("");
+  const [groupsCollapsed, setGroupsCollapsed] = useState(false);
   const inputHistory = useRef<string[]>([]);
   const historyIndex = useRef(-1);
+
+  // 使用 ref 缓存最新的回调函数，避免 useInput 闭包过期问题
+  const inputRef = useRef(input);
+  const isStreamingRef = useRef(isStreaming);
+  const showSlashMenuRef = useRef(showSlashMenu);
+  const showSessionListRef = useRef(showSessionList);
+  const isRenamingRef = useRef(isRenaming);
+  const slashFilterRef = useRef(slashFilter);
+  const selectedCmdIdxRef = useRef(selectedCmdIdx);
+  const selectedSessionIdxRef = useRef(selectedSessionIdx);
+  const cursorPosRef = useRef(cursorPos);
+  const sessionsRef = useRef(sessions);
+  const renameInputRef = useRef(renameInput);
+
+  inputRef.current = input;
+  isStreamingRef.current = isStreaming;
+  showSlashMenuRef.current = showSlashMenu;
+  showSessionListRef.current = showSessionList;
+  isRenamingRef.current = isRenaming;
+  slashFilterRef.current = slashFilter;
+  selectedCmdIdxRef.current = selectedCmdIdx;
+  selectedSessionIdxRef.current = selectedSessionIdx;
+  cursorPosRef.current = cursorPos;
+  sessionsRef.current = sessions;
+  renameInputRef.current = renameInput;
 
   // 收集所有斜杠命令
   const allCommands = useCallback(() => {
@@ -199,9 +242,10 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
 
   const filteredCommands = useCallback(() => {
     const cmds = allCommands();
-    if (!slashFilter) return cmds;
-    return cmds.filter((c) => c.name.startsWith(slashFilter));
-  }, [allCommands, slashFilter]);
+    const filter = slashFilterRef.current;
+    if (!filter) return cmds;
+    return cmds.filter((c) => c.name.startsWith(filter));
+  }, [allCommands]);
 
   // 订阅 agent 事件
   useEffect(() => {
@@ -223,17 +267,14 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
             setMessages((prev) => {
               const last = prev[prev.length - 1];
               if (!last) return prev;
-              // 原地修改 text 字段，保留引用于 memo 比较
               const text = extractMessageText(event.message);
-              if (last.text !== text) (prev[prev.length - 1] as MessageItem).text = text;
-              if (event.message.role === "assistant") {
-                const reasoning = (event.message as { reasoning?: string }).reasoning;
-                if (reasoning && last.reasoning !== reasoning) {
-                  (prev[prev.length - 1] as MessageItem).reasoning = reasoning;
-                }
-              }
-              // 返回新数组触发 re-render，但 MessageItem 引用保持不变
-              return [...prev];
+              const reasoning = (event.message as { reasoning?: string }).reasoning;
+              // 只有内容变化时才创建新对象触发重渲染
+              if (last.text === text && last.reasoning === reasoning) return prev;
+              const updated = { ...last, text, reasoning: reasoning ?? last.reasoning };
+              const next = [...prev];
+              next[next.length - 1] = updated;
+              return next;
             });
           }
           break;
@@ -262,6 +303,10 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
           setIsStreaming(false);
           setStatus("");
           break;
+        case "notification":
+          const id = notifIdRef.current++;
+          setNotifications((prev) => [...prev.slice(-9), { text: event.message, type: event.level, id }]);
+          return; // 不需要转发给插件
       }
       // 转发给插件
       await pluginRunner.emit(event);
@@ -305,6 +350,22 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
       return;
     }
 
+    // /plugins 命令
+    if (cmd === "plugins") {
+      if (args === "reload") {
+        onReloadPlugins?.();
+      } else {
+        const paths = pluginRunner.getPluginPaths();
+        const text = paths.length > 0
+          ? `Loaded plugins (${paths.length}):\n${paths.map((p) => `  - ${p}`).join("\n")}`
+          : "No plugins loaded.";
+        onNotify?.(text, "info");
+      }
+      setInput("");
+      setCursorPos(0);
+      return;
+    }
+
     // 插件命令
     const handled = await pluginRunner.executeCommand(cmd, args);
     if (handled) {
@@ -314,21 +375,21 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
     }
   }, [agent, pluginRunner, exit, onNewSession, onRenameSession]);
 
-  // 键盘输入处理
+  // 键盘输入处理 - 通过 ref 读取最新状态避免闭包过期
   useInput((inputChar, key) => {
     if (key.ctrl && inputChar === "c") {
       exit();
       return;
     }
-    if (key.escape && isStreaming) {
+    if (key.escape && isStreamingRef.current) {
       agent.abort();
       return;
     }
 
     // 会话重命名模式
-    if (isRenaming) {
+    if (isRenamingRef.current) {
       if (key.return) {
-        onRenameSession?.(renameInput);
+        onRenameSession?.(renameInputRef.current);
         setIsRenaming(false);
         setRenameInput("");
         return;
@@ -349,12 +410,16 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
     }
 
     // 会话列表选择模式
-    if (showSessionList) {
+    if (showSessionListRef.current) {
       if (key.return) {
-        if (sessions.length > 0 && selectedSessionIdx < sessions.length) {
-          onResumeSession?.(sessions[selectedSessionIdx]!.id);
+        const currentSessions = sessionsRef.current;
+        const currentIdx = selectedSessionIdxRef.current;
+        if (currentSessions.length > 0 && currentIdx < currentSessions.length) {
+          onResumeSession?.(currentSessions[currentIdx]!.id);
           setShowSessionList(false);
           setSelectedSessionIdx(0);
+          // 清除当前消息显示，切换到新 session
+          setMessages([]);
         }
         return;
       }
@@ -363,7 +428,7 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
         return;
       }
       if (key.downArrow) {
-        setSelectedSessionIdx((prev) => Math.min(sessions.length - 1, prev + 1));
+        setSelectedSessionIdx((prev) => Math.min(sessionsRef.current.length - 1, prev + 1));
         return;
       }
       if (key.escape) {
@@ -375,17 +440,17 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
     }
 
     // 斜杠菜单模式
-    if (showSlashMenu) {
+    if (showSlashMenuRef.current) {
       if (key.return) {
-        const cmds = filteredCommands();
-        if (cmds.length > 0) {
-          const selected = cmds[selectedCmdIdx];
-          const cmdText = "/" + selected.name;
-          submitCommand(cmdText);
-          setShowSlashMenu(false);
-          setSlashFilter("");
-          setSelectedCmdIdx(0);
+        // 发送用户当前输入的完整文本（如 "/ctx compact"）
+        const fullInput = inputRef.current;
+        if (fullInput) {
+          submitCommand(fullInput);
         }
+        setShowSlashMenu(false);
+        setSlashFilter("");
+        setSelectedCmdIdx(0);
+        showSlashMenuRef.current = false;
         return;
       }
       if (key.upArrow) {
@@ -393,13 +458,16 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
         return;
       }
       if (key.downArrow) {
-        const cmds = filteredCommands();
-        setSelectedCmdIdx((prev) => Math.min(cmds.length - 1, prev + 1));
+        setSelectedCmdIdx((prev) => {
+          const cmdsLen = filteredCommands().length;
+          return Math.min(cmdsLen - 1, prev + 1);
+        });
         return;
       }
       if (key.backspace || key.delete) {
-        if (slashFilter.length > 0) {
-          const newFilter = slashFilter.slice(0, -1);
+        const currentFilter = slashFilterRef.current;
+        if (currentFilter.length > 0) {
+          const newFilter = currentFilter.slice(0, -1);
           setSlashFilter(newFilter);
           setInput("/" + newFilter);
           setCursorPos(1 + newFilter.length);
@@ -407,6 +475,8 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
         } else {
           setShowSlashMenu(false);
           setSlashFilter("");
+          setSelectedCmdIdx(0);
+          showSlashMenuRef.current = false;
           setInput("");
           setCursorPos(0);
         }
@@ -416,22 +486,67 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
         setShowSlashMenu(false);
         setSlashFilter("");
         setSelectedCmdIdx(0);
+        showSlashMenuRef.current = false;
         return;
       }
       if (inputChar && !key.ctrl && !key.meta) {
-        const newFilter = slashFilter + inputChar;
+        const newFilter = slashFilterRef.current + inputChar;
         setSlashFilter(newFilter);
         setInput("/" + newFilter);
         setCursorPos(1 + newFilter.length);
         setSelectedCmdIdx(0);
+
+        // 如果输入了空格，关闭菜单，后续回车走正常提交流程
+        if (inputChar === " ") {
+          setShowSlashMenu(false);
+          showSlashMenuRef.current = false;
+        }
         return;
       }
       return;
     }
 
+    // Ctrl+O: 全局切换所有折叠组的展开/折叠
+    if (key.ctrl && inputChar === "o") {
+      setGroupsCollapsed((prev) => !prev);
+      return;
+    }
+
     // Enter: 提交输入
     if (key.return) {
-      handleSubmit();
+      // 直接读取最新的 input 值提交
+      setInput((currentInput) => {
+        const text = currentInput.trim();
+        if (!text || isStreamingRef.current) return currentInput;
+        // 在 setState 的 functional update 中异步执行提交
+        Promise.resolve().then(() => {
+          setShowSlashMenu(false);
+          setSlashFilter("");
+
+          // 保存到历史
+          inputHistory.current.push(text);
+          if (inputHistory.current.length > 100) {
+            inputHistory.current = inputHistory.current.slice(-100);
+          }
+          historyIndex.current = -1;
+
+          if (text.startsWith("/")) {
+            submitCommand(text);
+          } else {
+            setIsStreaming(true);
+            agent.prompt(text).catch((err: unknown) => {
+              setMessages((prev) => [
+                ...prev,
+                { role: "error" as const, text: err instanceof Error ? err.message : String(err), isStreaming: false, toolCalls: [], toolResults: [] },
+              ]);
+            }).finally(() => {
+              setIsStreaming(false);
+            });
+          }
+        });
+        return ""; // 清空输入框
+      });
+      setCursorPos(0);
       return;
     }
 
@@ -443,7 +558,7 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
     }
     if (key.rightArrow) {
       historyIndex.current = -1;
-      setCursorPos((prev) => Math.min(input.length, prev + 1));
+      setCursorPos((prev) => Math.min(inputRef.current.length, prev + 1));
       return;
     }
     if (inputChar === "a" && key.ctrl) {
@@ -453,26 +568,28 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
     }
     if (inputChar === "e" && key.ctrl) {
       historyIndex.current = -1;
-      setCursorPos(input.length);
+      setCursorPos(inputRef.current.length);
       return;
     }
 
     // Backspace: 在光标位置删除
     if (key.backspace || key.delete) {
       historyIndex.current = -1;
-      if (cursorPos > 0) {
-        const before = input.slice(0, cursorPos - 1);
-        const after = input.slice(cursorPos);
-        const newInput = before + after;
-        setInput(newInput);
-        setCursorPos(cursorPos - 1);
-
-        // 检查斜杠菜单
-        if (newInput.startsWith("/") && !newInput.includes(" ")) {
-          setShowSlashMenu(true);
-          setSlashFilter(newInput.slice(1));
-          setSelectedCmdIdx(0);
-        }
+      const curPos = cursorPosRef.current;
+      if (curPos > 0) {
+        setInput((prev) => {
+          const before = prev.slice(0, curPos - 1);
+          const after = prev.slice(curPos);
+          const newInput = before + after;
+          // 检查斜杠菜单
+          if (newInput.startsWith("/") && !newInput.includes(" ")) {
+            setShowSlashMenu(true);
+            setSlashFilter(newInput.slice(1));
+            setSelectedCmdIdx(0);
+          }
+          return newInput;
+        });
+        setCursorPos((prev) => Math.max(0, prev - 1));
       }
       return;
     }
@@ -505,67 +622,38 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
     // 可打印字符：在光标位置插入
     if (inputChar && !key.ctrl && !key.meta) {
       historyIndex.current = -1;
-      const before = input.slice(0, cursorPos);
-      const after = input.slice(cursorPos);
-      const newInput = before + inputChar + after;
-      const newPos = cursorPos + inputChar.length;
-      setInput(newInput);
-      setCursorPos(newPos);
+      // 先计算新光标位置，再更新 input，React 18 会自动 batch 为一次 render
+      const curPos = cursorPosRef.current;
+      const newCursorPos = curPos + inputChar.length;
+      setInput((prev) => {
+        const before = prev.slice(0, curPos);
+        const after = prev.slice(curPos);
+        const newInput = before + inputChar + after;
 
-      // 如果输入了 / 且没有空格，显示斜杠菜单
-      if (newInput.startsWith("/") && !newInput.includes(" ")) {
-        setShowSlashMenu(true);
-        setSlashFilter(newInput.slice(1));
-        setSelectedCmdIdx(0);
-      } else if (showSlashMenu) {
-        // 输入空格关闭菜单
-        if (inputChar === " ") {
-          setShowSlashMenu(false);
-          setSlashFilter("");
+        // 如果输入了 / 且没有空格，显示斜杠菜单
+        // 空格处理统一在斜杠菜单模式分支中完成
+        if (newInput.startsWith("/") && !newInput.includes(" ")) {
+          setShowSlashMenu(true);
+          setSlashFilter(newInput.slice(1));
+          setSelectedCmdIdx(0);
         }
-      }
 
+        return newInput;
+      });
+      setCursorPos(newCursorPos);
       return;
     }
   });
 
-  const handleSubmit = useCallback(async () => {
-    const text = input.trim();
-    if (!text || isStreaming) return;
-
-    // 关闭斜杠菜单
-    setShowSlashMenu(false);
-    setSlashFilter("");
-
-    // 保存到历史（最多 100 条）
-    inputHistory.current.push(text);
-    if (inputHistory.current.length > 100) {
-      inputHistory.current = inputHistory.current.slice(-100);
+  // 输入完成后校正光标位置，解决 IME 中文输入时光标错位问题
+  // 每次 input 长度变化时校正光标，避免 IME 合成后光标超出范围
+  const prevInputLenRef = useRef(input.length);
+  useEffect(() => {
+    if (input.length !== prevInputLenRef.current) {
+      prevInputLenRef.current = input.length;
+      setCursorPos((prev) => Math.min(prev, input.length));
     }
-    historyIndex.current = -1;
-
-    // 处理斜杠命令
-    if (text.startsWith("/")) {
-      setInput("");
-      setCursorPos(0);
-      await submitCommand(text);
-      return;
-    }
-
-    setInput("");
-    setCursorPos(0);
-    setIsStreaming(true);
-    try {
-      await agent.prompt(text);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "error" as const, text: err instanceof Error ? err.message : String(err), isStreaming: false, toolCalls: [], toolResults: [] },
-      ]);
-    } finally {
-      setIsStreaming(false);
-    }
-  }, [input, isStreaming, agent, submitCommand]);
+  }, [input]);
 
   // 渲染输入框：光标用竖线 | 显示（参考 openwiki 设计）
   const renderInput = () => {
@@ -615,6 +703,17 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
         </Box>
       )}
 
+      {/* Notifications */}
+      {notifications.length > 0 && (
+        <Box flexDirection="column" marginBottom={1}>
+          {notifications.map((n) => (
+            <Text key={n.id} color={n.type === "error" ? "red" : n.type === "warning" ? "yellow" : "cyan"}>
+              [{n.type.toUpperCase()}] {n.text}
+            </Text>
+          ))}
+        </Box>
+      )}
+
       {/* Session list (floating overlay above input) */}
       {showSessionList && (
         <Box
@@ -647,9 +746,18 @@ function TUIApp({ agent, pluginRunner, cwd, sessionId, sessions = [], onNewSessi
 
       {/* Messages - scrollable area */}
       <Box flexDirection="column" flexGrow={1} paddingX={1}>
-        {messages.map((msg, i) => (
-          <MessageView key={`msg-${i}`} item={msg} />
-        ))}
+        {mergeMessageGroups(messages).map((group) => {
+          return group.type === "group" ? (
+            <CollapsibleGroup
+              key={`group-${group.index}`}
+              items={group.items}
+              collapsed={groupsCollapsed}
+              onToggle={() => setGroupsCollapsed((prev) => !prev)}
+            />
+          ) : (
+            <MessageView key={`msg-${group.index}`} item={group.item} />
+          );
+        })}
         {isStreaming && status && (
           <Text color="yellow" italic>
             {status}
@@ -758,37 +866,47 @@ function mergeMessageGroups(messages: MessageItem[]): MessageGroup[] {
 
 const CollapsibleGroup = memo(function CollapsibleGroup({
   items,
-  defaultCollapsed,
+  collapsed,
+  onToggle,
 }: {
   items: MessageItem[];
-  defaultCollapsed: boolean;
+  collapsed: boolean;
+  onToggle: () => void;
 }) {
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
-
-  useInput((input, key) => {
-    if (key.ctrl && input === "o") setCollapsed((v) => !v);
-  });
-
   const first = items[0]!;
   const toolCount = items.filter((m) => m.role === "toolResult").length;
-  const color = first.role === "assistant" ? "green" : "white";
+  const hasReasoning = items.some((m) => m.reasoning);
 
   return (
     <Box flexDirection="column" marginBottom={1}>
-      <Text>
-        <Text color={collapsed ? "gray" : color} bold>
-          {collapsed ? "▶" : "▼"}
-        </Text>{" "}
-        <Text color={color} bold>
-          {first.role === "assistant" ? "Assistant" : "Tool"}
-        </Text>
-        <Text color="gray">
-          {" "}({toolCount} tool call{toolCount !== 1 ? "s" : ""})
-        </Text>
-      </Text>
-      {!collapsed && items.map((item, i) => (
-        <MessageView key={i} item={item} />
-      ))}
+      {/* 始终显示 assistant 主文本 */}
+      <MessageView item={first} />
+
+      {/* 当有 toolResult 或 reasoning 时，显示折叠控制栏 */}
+      {(toolCount > 0 || hasReasoning) && (
+        <>
+          <Box paddingLeft={1}>
+            <Text>
+              <Text
+                color={collapsed ? "gray" : "yellow"}
+                bold
+              >
+                {collapsed ? "▶" : "▼"}
+              </Text>{" "}
+              <Text color="gray">
+                {collapsed
+                  ? `${toolCount} tool call${toolCount !== 1 ? "s" : ""}${hasReasoning ? " + reasoning" : ""} (Ctrl+O to expand)`
+                  : "Details:"
+                }
+              </Text>
+            </Text>
+          </Box>
+          {/* 展开时才显示 toolResult 和 reasoning */}
+          {!collapsed && items.slice(1).map((item, i) => (
+            <MessageView key={i} item={item} />
+          ))}
+        </>
+      )}
     </Box>
   );
 });
@@ -797,11 +915,11 @@ const CollapsibleGroup = memo(function CollapsibleGroup({
 // Markdown 渲染（基于 marked）
 // ---------------------------------------------------------------------------
 
-function MarkdownText({ markdown }: { markdown: string }) {
-  const tokens = marked.lexer(markdown, {
+const MarkdownText = memo(function MarkdownText({ markdown }: { markdown: string }) {
+  const tokens = useMemo(() => marked.lexer(markdown, {
     async: false,
     gfm: true,
-  });
+  }), [markdown]);
 
   return (
     <Box flexDirection="column">
@@ -810,9 +928,9 @@ function MarkdownText({ markdown }: { markdown: string }) {
       ))}
     </Box>
   );
-}
+});
 
-function MarkdownBlock({ token }: { token: Token }) {
+const MarkdownBlock = memo(function MarkdownBlock({ token }: { token: Token }) {
   if (token.type === "space" || token.type === "def" || token.type === "hr") {
     return null;
   }
@@ -880,9 +998,9 @@ function MarkdownBlock({ token }: { token: Token }) {
   }
 
   return <Text wrap="wrap">{token.raw}</Text>;
-}
+});
 
-function InlineMarkdown({ tokens }: { tokens: Token[] }) {
+const InlineMarkdown = memo(function InlineMarkdown({ tokens }: { tokens: Token[] }) {
   return (
     <>
       {tokens.map((token, index) => (
@@ -890,9 +1008,9 @@ function InlineMarkdown({ tokens }: { tokens: Token[] }) {
       ))}
     </>
   );
-}
+});
 
-function InlineMarkdownToken({ token }: { token: Token }) {
+const InlineMarkdownToken = memo(function InlineMarkdownToken({ token }: { token: Token }) {
   if (token.type === "text" || token.type === "escape") {
     return <>{token.text}</>;
   }
@@ -946,16 +1064,59 @@ function InlineMarkdownToken({ token }: { token: Token }) {
   }
 
   return <>{token.raw}</>;
-}
+});
 
 function getTokenChildren(token: Token): Token[] {
   return "tokens" in token && Array.isArray(token.tokens) ? token.tokens : [];
 }
 
 function renderPlainTable(token: Tokens.Table): string {
-  const header = token.header.map((cell) => cell.text).join(" | ");
-  const rows = token.rows.map((row) => row.map((cell) => cell.text).join(" | "));
-  return [header, ...rows].filter(Boolean).join("\n");
+  const rows: string[][] = [];
+  // 表头
+  rows.push(token.header.map((cell) => cell.text));
+  // 分隔行（用 --- 占位）
+  rows.push(token.header.map(() => "---"));
+  // 数据行
+  for (const row of token.rows) {
+    rows.push(row.map((cell) => cell.text));
+  }
+
+  // 计算每列最大宽度
+  const colCount = rows[0]?.length ?? 0;
+  const colWidths: number[] = [];
+  for (let c = 0; c < colCount; c++) {
+    let maxW = 0;
+    for (const row of rows) {
+      const cell = row[c] ?? "";
+      // 一个中文字符算 2 个宽度（终端等宽字体下对齐更准确）
+      let w = 0;
+      for (const ch of cell) {
+        w += ch.charCodeAt(0) > 127 ? 2 : 1;
+      }
+      if (w > maxW) maxW = w;
+    }
+    colWidths.push(maxW);
+  }
+
+  // 格式化输出
+  return rows.map((row, ri) => {
+    if (ri === 1) {
+      // 分隔行
+      return colWidths.map((w) => "-".repeat(w)).join("-+-");
+    }
+    const cells = row.map((cell, ci) => {
+      const w = colWidths[ci] ?? 0;
+      const text = cell ?? "";
+      // 计算实际显示宽度
+      let displayW = 0;
+      for (const ch of text) {
+        displayW += ch.charCodeAt(0) > 127 ? 2 : 1;
+      }
+      // 填充空格
+      return text + " ".repeat(Math.max(0, w - displayW));
+    });
+    return " " + cells.join(" | ") + " ";
+  }).join("\n");
 }
 
 export async function renderTUI(
@@ -968,6 +1129,9 @@ export async function renderTUI(
     onNewSession?: () => Promise<void>;
     onResumeSession?: (sessionId: string) => Promise<void>;
     onRenameSession?: (name: string) => Promise<void>;
+    onNotify?: (message: string, type?: "info" | "warning" | "error") => void;
+    onSetInitialMessages?: (setter: (messages: AgentMessage[]) => void) => void;
+    onReloadPlugins?: () => Promise<void>;
   },
 ): Promise<void> {
   const { waitUntilExit } = render(
@@ -980,6 +1144,9 @@ export async function renderTUI(
       onNewSession={options?.onNewSession}
       onResumeSession={options?.onResumeSession}
       onRenameSession={options?.onRenameSession}
+      onNotify={options?.onNotify}
+      onSetInitialMessages={options?.onSetInitialMessages}
+      onReloadPlugins={options?.onReloadPlugins}
     />,
     { exitOnCtrlC: true },
   );
