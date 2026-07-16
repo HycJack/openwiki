@@ -1,9 +1,12 @@
 /**
- * 配置管理 - ~/.tca/config.json
+ * Configuration management — ~/.tca/config.json
  *
  * 按工作目录保存和加载用户配置：
  * - 默认 model/provider/apiKey
  * - 用户偏好设置
+ * - 插件配置
+ *
+ * 参考 openwiki/tui-coding-agent 的 config.ts 设计。
  */
 
 import { readFile, mkdir, writeFile } from "node:fs/promises";
@@ -27,6 +30,12 @@ export interface TCAConfig {
     baseURL?: string;
     apiKey?: string;
   }>;
+  /** 启用的插件列表 */
+  plugins?: string[];
+  /** 启用的工具列表 */
+  tools?: string[];
+  /** 自定义系统提示 */
+  systemPrompt?: string;
 }
 
 const CONFIG_PATH = path.join(os.homedir(), ".tca", "config.json");

@@ -1,40 +1,39 @@
 {
-  "name": "tui-coding-agent",
-  "version": "0.1.0",
-  "description": "A plugin-based TUI coding agent",
+  "name": "tui-agent-refactor",
+  "version": "0.2.0",
+  "description": "A plugin-based TUI coding agent with pi-mono style session management, session-store, and slot-based UI architecture (using @earendil-works/pi-tui)",
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "bin": {
-    "tca": "./dist/cli.js"
+    "tca": "./src/cli.ts"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "bundle": "tsc -p tsconfig.json && node --experimental-sea-config sea-config.json && npx postject dist/sea-node.exe NODE_SEA_BLOB dist/sea.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite",
-    "dev": "tsx src/cli.tsx",
-    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "start": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "eslint src/ --ext .ts,.tsx"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-vm-modules --test src/**/*.test.ts"
   },
+  "keywords": [
+    "tui",
+    "terminal",
+    "agent",
+    "coding-agent",
+    "llm",
+    "ai",
+    "pi-mono"
+  ],
   "dependencies": {
-    "@langchain/anthropic": "^1.5.1",
-    "@langchain/core": "^1.2.1",
-    "@langchain/openai": "^1.5.5",
-    "ink": "^5.1.0",
+    "@earendil-works/pi-tui": "^0.80.7",
+    "chalk": "^5.6.2",
     "marked": "^18.0.6",
-    "react": "^18.3.1",
-    "typebox": "^1.1.38",
-    "yaml": "^2.9.0"
+    "typebox": "^1.1.38"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "@types/react": "^18.3.17",
-    "@typescript-eslint/eslint-plugin": "^8.64.0",
-    "@typescript-eslint/parser": "^8.64.0",
-    "esbuild": "^0.28.1",
-    "eslint": "^10.7.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

@@ -1,7 +1,7 @@
 /**
  * 系统提示词构建
  *
- * 参考 openwiki 的 createSystemPrompt 和 pi-mono 的 system-prompt.ts 设计。
+ * 参考 openwiki/tui-coding-agent 的 system-prompt.ts 设计。
  * 参考 pi-mono 的 formatSkillsForSystemPrompt 模式，将工具描述注入系统提示词。
  */
 

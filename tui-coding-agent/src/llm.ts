@@ -1,7 +1,7 @@
 /**
  * LLM Provider 抽象层
  *
- * 参考 openwiki 的 createModel 模式，支持 OpenAI 和 Anthropic。
+ * 参考 openwiki/tui-coding-agent 的 createModel 模式。
  * 参考 pi-mono 的 streamSimple 接口设计。
  */
 
@@ -18,13 +18,7 @@ export interface StreamEvent {
   toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
   error?: string;
   usage?: { input: number; output: number; totalTokens: number };
-}
-
-export interface StreamResult {
-  content: Array<{ type: "text"; text: string } | { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }>;
-  stopReason: "stop" | "length" | "tool_use" | "error";
-  errorMessage?: string;
-  usage?: { input: number; output: number; totalTokens: number };
+  finishReason?: "stop" | "length" | "tool_calls";
 }
 
 export type StreamFn = (
@@ -49,7 +43,9 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 /**
  * 构建 LLM 请求的工具描述。
  */
-export function buildToolDescriptors(tools: Array<{ name: string; description: string; parameters: unknown }>) {
+export function buildToolDescriptors(
+  tools: Array<{ name: string; description: string; parameters: unknown }>,
+) {
   return tools.map((t) => ({
     type: "function" as const,
     function: {

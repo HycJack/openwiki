@@ -1,11 +1,11 @@
 /**
  * OpenAI 兼容的 LLM Provider
  *
- * 参考 openwiki 的 ChatOpenAI 用法，使用 fetch 直接调用 OpenAI Responses/Chat API。
+ * 参考 openwiki/tui-coding-agent 的 ChatOpenAI 用法，使用 fetch 直接调用 OpenAI API。
  * 支持 OpenAI、OpenRouter 及任何 OpenAI 兼容的 endpoint。
  */
 
-import type { ModelConfig, Message } from "../types.js";
+import type { ModelConfig, Message, ToolCallContent } from "../types.js";
 import type { StreamEvent, StreamOptions } from "../llm.js";
 import { buildToolDescriptors } from "../llm.js";
 
@@ -26,14 +26,17 @@ function toOpenAIMessages(messages: Message[], systemPrompt: string): OpenAIMess
         if (c.type === "image") return { type: "image_url", image_url: { url: `data:${c.mimeType};base64,${c.data}` } };
         return { type: "text", text: "" };
       });
-      result.push({ role: "user", content: content.length === 1 && content[0].type === "text" ? content[0].text! : content });
+      result.push({
+        role: "user",
+        content: content.length === 1 && content[0].type === "text" ? content[0].text! : content,
+      });
     } else if (msg.role === "assistant") {
       const textParts = msg.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text);
       const toolCalls = msg.content
-        .filter((c) => c.type === "toolCall")
-        .map((c) => {
-          const tc = c as { id: string; name: string; arguments: Record<string, unknown> };
-          return { id: tc.id, type: "function" as const, function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } };
+        .filter((c): c is ToolCallContent => c.type === "toolCall")
+        .map((tc) => {
+          const argsStr = typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments);
+          return { id: tc.id, type: "function" as const, function: { name: tc.name, arguments: argsStr } };
         });
       const entry: OpenAIMessage = { role: "assistant", content: textParts.join("") };
       if (toolCalls.length > 0) entry.tool_calls = toolCalls;
@@ -48,19 +51,31 @@ function toOpenAIMessages(messages: Message[], systemPrompt: string): OpenAIMess
   return result;
 }
 
-/**
- * 合并两个 AbortSignal，任一触发则整体 abort。
- */
-function combineAbortSignals(...signals: AbortSignal[]): AbortSignal {
-  const controller = new AbortController();
-  for (const signal of signals) {
-    if (signal.aborted) {
-      controller.abort(signal.reason);
-      return controller.signal;
+class AbortSignalCombo {
+  private _controller: AbortController;
+  private _cleanups: Array<() => void> = [];
+
+  constructor(...signals: AbortSignal[]) {
+    this._controller = new AbortController();
+    for (const signal of signals) {
+      if (signal.aborted) {
+        this._controller.abort(signal.reason);
+        break;
+      }
+      const handler = () => this._controller.abort(signal.reason);
+      signal.addEventListener("abort", handler, { once: true });
+      this._cleanups.push(() => signal.removeEventListener("abort", handler));
     }
-    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
   }
-  return controller.signal;
+
+  get signal(): AbortSignal {
+    return this._controller.signal;
+  }
+
+  destroy(): void {
+    for (const cleanup of this._cleanups) cleanup();
+    this._cleanups.length = 0;
+  }
 }
 
 export async function* streamOpenAI(
@@ -86,25 +101,24 @@ export async function* streamOpenAI(
     body.tools = buildToolDescriptors(tools);
   }
 
-  // 带超时和重试的请求
-  const ABORT_TIMEOUT = 120_000; // 2 minutes
+  const ABORT_TIMEOUT = 120_000;
   const MAX_RETRIES = 2;
   let lastError: string | undefined;
 
+  // 收集 finish_reason（在流式末尾 chunk 中设置）
+  let lastFinishReason: "stop" | "length" | "tool_calls" | undefined;
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      // 指数退避
       await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
     }
 
-    // 创建带超时的 abort controller
     const timeoutController = new AbortController();
     const timeoutTimer = setTimeout(() => timeoutController.abort(), ABORT_TIMEOUT);
-
-    // 合并外部 signal 和超时 signal
-    const combinedSignal = options?.signal
-      ? combineAbortSignals(options.signal, timeoutController.signal)
-      : timeoutController.signal;
+    const combo = new AbortSignalCombo(
+      ...(options?.signal ? [options.signal, timeoutController.signal] : [timeoutController.signal]),
+    );
+    const combinedSignal = combo.signal;
 
     try {
       const response = await fetch(`${baseURL}/chat/completions`, {
@@ -118,19 +132,18 @@ export async function* streamOpenAI(
       });
 
       clearTimeout(timeoutTimer);
+      combo.destroy();
 
       if (!response.ok || !response.body) {
         const text = await response.text().catch(() => "");
         lastError = `API error ${response.status}: ${text}`;
         if (response.status < 500 && response.status !== 429) {
-          // 非服务端错误（4xx），不重试
           yield { type: "error", error: lastError };
           return;
         }
-        continue; // 服务端错误（5xx/429），重试
+        continue;
       }
 
-      // 成功获取响应，处理流
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -163,9 +176,11 @@ export async function* streamOpenAI(
                 yield { type: "text_delta", delta: delta.content };
               }
 
-              // reasoning_content 字段（deepseek-r1, o1 等模型的思考内容）
               if ((delta as Record<string, unknown>)?.reasoning_content) {
-                yield { type: "reasoning_delta", delta: (delta as Record<string, string>).reasoning_content };
+                yield {
+                  type: "reasoning_delta",
+                  delta: (delta as Record<string, string>).reasoning_content,
+                };
               }
 
               if (delta?.tool_calls) {
@@ -184,6 +199,14 @@ export async function* streamOpenAI(
               if (chunk.usage) {
                 totalInput = chunk.usage.prompt_tokens ?? totalInput;
                 totalOutput = chunk.usage.completion_tokens ?? totalOutput;
+              }
+
+              // 处理 finish_reason
+              if (choice.finish_reason) {
+                const reason = choice.finish_reason as string;
+                if (reason === "stop" || reason === "length" || reason === "tool_calls") {
+                  lastFinishReason = reason;
+                }
               }
             } catch {
               // skip malformed chunks
@@ -207,20 +230,20 @@ export async function* streamOpenAI(
       yield {
         type: "done",
         usage: { input: totalInput, output: totalOutput, totalTokens: totalInput + totalOutput },
+        finishReason: lastFinishReason,
       };
-      return; // 成功，退出
+      return;
     } catch (error) {
       clearTimeout(timeoutTimer);
+      combo.destroy();
       const msg = error instanceof Error ? error.message : String(error);
       if (options?.signal?.aborted) {
         yield { type: "error", error: "Request aborted" };
         return;
       }
       lastError = msg;
-      // 继续重试循环
     }
   }
 
-  // 所有重试都失败
   yield { type: "error", error: lastError ?? "Request failed after retries" };
 }

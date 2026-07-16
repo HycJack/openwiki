@@ -1,95 +1,63 @@
-/**
- * 插件加载器
- *
- * 参考 pi-mono 的 extensions/loader.ts 设计：
- * - 使用 dynamic import 加载 TypeScript/JavaScript 插件模块
- * - 从标准位置自动发现插件（.tca/plugins/ 目录）
- * - 支持项目级和全局级插件
- *
- * 简化版：使用 tsx 的 require 机制或 Node.js 的 import() 加载 .js 文件。
- */
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
-import type { Plugin, PluginAPI, PluginFactory, PluginLoadResult, PluginRuntime } from "./types.js";
+import type { Plugin, ExtensionAPI, PluginFactory, PluginLoadResult, PluginRuntime, PluginCommandContext, PluginUIContext } from "../types.js";
 
-/**
- * 创建插件运行时（初始为 stub，由 runner.bindCore 替换）。
- */
 export function createPluginRuntime(): PluginRuntime {
-  const notInit = () => {
-    throw new Error("Plugin runtime not initialized. Action methods cannot be called during plugin loading.");
-  };
-  return {
-    sendMessage: notInit,
-    getActiveTools: notInit,
-    getAllTools: notInit,
-    setActiveTools: notInit,
-    notify: () => {},
-  };
+  const ni = () => { throw new Error("Runtime not initialized"); };
+  return { sendMessage: ni, getActiveTools: ni, getAllTools: ni, setActiveTools: ni, notify: () => {} };
 }
 
-/**
- * 创建 PluginAPI，将注册方法绑定到 Plugin 对象。
- */
-function createPluginAPI(
-  plugin: Plugin,
-  runtime: PluginRuntime,
-  cwd: string,
-): PluginAPI {
+function createExtensionAPI(plugin: Plugin, runtime: PluginRuntime, cwd: string): ExtensionAPI {
+  const ui: PluginUIContext = {
+    notify: (m, t) => runtime.notify(m, t),
+    setStatus: (k, t) => runtime.setStatus?.(k, t),
+    setWidget: (k, c, o) => runtime.setWidget?.(k, c, o),
+    setHeader: (c, co) => runtime.setHeader?.(c, co),
+    setFooter: (c, co) => runtime.setFooter?.(c, co),
+    setTitle: (t) => runtime.setTitle?.(t),
+  };
+
   return {
-    on(event: string, handler: (...args: unknown[]) => unknown): void {
+    on(event, handler) {
       const list = plugin.handlers.get(event) ?? [];
       list.push(handler);
       plugin.handlers.set(event, list);
     },
-
-    registerTool(tool): void {
-      plugin.tools.set(tool.name, tool);
-    },
-
-    registerCommand(name, handler): void {
-      plugin.commands.set(name, { name, handler });
-    },
-
-    notify(message, type): void {
-      runtime.notify(message, type);
-    },
-
-    exec(command, args, execCwd): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-      return new Promise((resolve) => {
-        const child = execFile(
-          command,
-          args,
-          { cwd: execCwd ?? cwd, maxBuffer: 1024 * 1024, timeout: 30_000 },
-          (error, stdout, stderr) => {
-            resolve({
-              stdout: stdout ?? "",
-              stderr: stderr ?? "",
-              exitCode: typeof error?.code === "number" ? error.code : (error ? 1 : 0),
-            });
-          },
-        );
-        child.on("error", () => { /* handled by callback */ });
+    registerTool(tool) { plugin.tools.set(tool.name, tool); },
+    registerCommand(name, handler) {
+      plugin.commands.set(name, {
+        name,
+        handler: async (ctx: PluginCommandContext, args: string) => {
+          await handler(ctx, args);
+        },
       });
     },
-
-    getActiveTools(): string[] {
-      return runtime.getActiveTools();
+    notify: (m, t) => runtime.notify(m, t),
+    exec(command, args, execCwd) {
+      return new Promise((resolve) => {
+        const child = execFile(command, args, {
+          cwd: execCwd ?? cwd,
+          maxBuffer: 1024 * 1024,
+          timeout: 30_000,
+        }, (error, stdout, stderr) => {
+          resolve({
+            stdout: stdout ?? "",
+            stderr: stderr ?? "",
+            exitCode: error ? (error as NodeJS.ErrnoException).code === "ETIMEDOUT" ? 124 : 1 : 0,
+          });
+        });
+        child.on("error", () => {});
+      });
     },
-
-    setActiveTools(toolNames): void {
-      runtime.setActiveTools(toolNames);
-    },
+    getActiveTools: () => runtime.getActiveTools(),
+    setActiveTools: (t) => runtime.setActiveTools(t),
+    get ui() { return ui; },
   };
 }
 
-/**
- * 创建空的 Plugin 对象。
- */
 function createPlugin(pluginPath: string): Plugin {
   return {
     name: path.basename(pluginPath, path.extname(pluginPath)),
@@ -100,29 +68,17 @@ function createPlugin(pluginPath: string): Plugin {
   };
 }
 
-/**
- * 确保插件目录的依赖已安装。
- * 如果存在 package.json 且 node_modules 不存在，自动执行 npm install。
- */
 async function ensurePluginDeps(dirPath: string): Promise<void> {
   const pkgPath = path.join(dirPath, "package.json");
-  const nodeModulesPath = path.join(dirPath, "node_modules");
-  if (!fs.existsSync(pkgPath) || fs.existsSync(nodeModulesPath)) return;
+  if (!fs.existsSync(pkgPath) || fs.existsSync(path.join(dirPath, "node_modules"))) return;
   try {
     const { execSync } = await import("node:child_process");
-    execSync("npm install --no-audit --no-fund", {
-      cwd: dirPath,
-      stdio: "ignore",
-      timeout: 120_000,
-    });
+    execSync("npm install --no-audit --no-fund", { cwd: dirPath, stdio: "ignore", timeout: 120_000 });
   } catch {
-    // 静默失败，后续 import 会报错
+    // skip dependency installation errors
   }
 }
 
-/**
- * 加载单个插件模块。
- */
 export async function loadPlugin(
   pluginPath: string,
   cwd: string,
@@ -131,64 +87,45 @@ export async function loadPlugin(
   try {
     const resolvedPath = path.resolve(cwd, pluginPath);
     const fileUrl = pathToFileURL(resolvedPath).href;
-
-    // 确保插件目录的依赖已安装
     await ensurePluginDeps(path.dirname(resolvedPath));
 
-    // 确保 .ts 文件可被 import（在 dist/ 模式下需要 tsx）
-    if (resolvedPath.endsWith(".ts") && !process.execArgv.some((a) => a.includes("tsx"))) {
-      try {
-        // tsx 无类型声明文件，动态 import 绕开类型检查
-        // @ts-expect-error - tsx has no types
-        await import("tsx");
-      } catch {
-        // tsx 不可用，继续尝试 import，失败时会被 catch
-      }
-    }
-
-    // 动态导入模块
     const module = await import(fileUrl);
     const factory = (module.default ?? module) as PluginFactory;
-
     if (typeof factory !== "function") {
-      return { plugin: null, error: `Plugin does not export a valid factory function: ${pluginPath}` };
+      return { plugin: null, error: `Plugin does not export a factory function: ${pluginPath}` };
     }
 
     const plugin = createPlugin(resolvedPath);
-    const api = createPluginAPI(plugin, runtime, cwd);
-    await factory(api);
+    const api = createExtensionAPI(plugin, runtime, cwd);
+    const result = factory(api);
+
+    // Support async factories (pi-mono style)
+    if (result && typeof result === "object" && "then" in result) {
+      await result;
+    }
 
     return { plugin, error: null };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { plugin: null, error: `Failed to load plugin: ${message}` };
+    return { plugin: null, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-/**
- * 从目录发现插件文件。
- *
- * 发现规则：
- * 1. 直接文件：.tca/plugins/ 下的 .ts 或 .js 文件
- * 2. 子目录：.tca/plugins/子目录/ 下的 index.ts 或 index.js
- */
 export function discoverPlugins(pluginDir: string): string[] {
   if (!fs.existsSync(pluginDir)) return [];
-
   const discovered: string[] = [];
   try {
-    const entries = fs.readdirSync(pluginDir, { withFileTypes: true });
-    for (const entry of entries) {
+    for (const entry of fs.readdirSync(pluginDir, { withFileTypes: true })) {
       const entryPath = path.join(pluginDir, entry.name);
-      if ((entry.isFile() || entry.isSymbolicLink()) && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+      if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
         discovered.push(entryPath);
       } else if (entry.isDirectory()) {
-        const indexTs = path.join(entryPath, "index.ts");
-        const indexJs = path.join(entryPath, "index.js");
-        if (fs.existsSync(indexTs)) {
-          discovered.push(indexTs);
-        } else if (fs.existsSync(indexJs)) {
-          discovered.push(indexJs);
+        // Check for index.ts or index.js in subdirectory
+        for (const f of ["index.ts", "index.js"]) {
+          const fp = path.join(entryPath, f);
+          if (fs.existsSync(fp)) {
+            discovered.push(fp);
+            break;
+          }
         }
       }
     }
@@ -198,9 +135,6 @@ export function discoverPlugins(pluginDir: string): string[] {
   return discovered;
 }
 
-/**
- * 加载多个插件。
- */
 export async function loadPlugins(
   paths: string[],
   cwd: string,
@@ -209,28 +143,22 @@ export async function loadPlugins(
   const plugins: Plugin[] = [];
   const errors: Array<{ path: string; error: string }> = [];
 
-  for (const pluginPath of paths) {
-    const { plugin, error } = await loadPlugin(pluginPath, cwd, runtime);
+  for (const p of paths) {
+    const { plugin, error } = await loadPlugin(p, cwd, runtime);
     if (error) {
-      errors.push({ path: pluginPath, error });
-      continue;
+      errors.push({ path: p, error });
+    } else if (plugin) {
+      plugins.push(plugin);
     }
-    if (plugin) plugins.push(plugin);
   }
 
   return { plugins, errors };
 }
 
-/**
- * 获取插件目录路径。
- */
 export function getPluginDir(cwd: string): string {
   return path.join(cwd, ".tca", "plugins");
 }
 
-/**
- * 获取全局插件目录。
- */
 export function getGlobalPluginDir(): string {
   return path.join(os.homedir(), ".tca", "plugins");
 }

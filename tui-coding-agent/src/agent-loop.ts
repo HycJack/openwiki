@@ -1,11 +1,10 @@
 /**
  * Agent Loop - LLM 调用和工具执行的核心循环
  *
- * 参考 pi-mono 的 runLoop 设计：
+ * 参考 pi-mono 的 runLoop 和 openwiki/tui-coding-agent 的 agent-loop.ts 设计：
  * - 外层循环：follow-up 消息
  * - 内层循环：LLM 响应 + 工具调用 + steering 消息
- *
- * 参考 openwiki 的 streamEvents 模式，通过 emit 回调推送事件。
+ * - 通过 emit 回调推送事件
  */
 
 import type {
@@ -13,15 +12,30 @@ import type {
   AgentEvent,
   AgentLoopConfig,
   AgentMessage,
+  AgentTool,
   AssistantMessage,
   ToolResultMessage,
   AgentToolResult,
   ContentBlock,
   TextContent,
+  TokenUsage,
   ToolCallContent,
   ToolResultContent,
 } from "./types.js";
 import { streamOpenAI } from "./providers/openai.js";
+import {
+  estimateContextUsage,
+  shouldCompact,
+  DEFAULT_RESERVE_TOKENS,
+} from "./token-estimate.js";
+import {
+  findCutPoint,
+  buildCompactedMessages,
+  buildCompactionPrompt,
+  createCompactionEntry,
+  type CompactionConfig,
+  DEFAULT_COMPACTION_CONFIG,
+} from "./compaction.js";
 
 export type EventSink = (event: AgentEvent) => Promise<void> | void;
 
@@ -72,13 +86,13 @@ export async function runAgentLoopContinue(
   const newMessages: AgentMessage[] = [];
   await emit({ type: "agent_start" });
   await emit({ type: "turn_start" });
-  await runLoop({ ...context }, newMessages, config, signal, emit);
+  await runLoop(
+    { ...context, messages: [...context.messages] },
+    newMessages, config, signal, emit,
+  );
   return newMessages;
 }
 
-/**
- * 主循环逻辑。
- */
 async function runLoop(
   initialContext: AgentContext,
   newMessages: AgentMessage[],
@@ -100,7 +114,6 @@ async function runLoop(
         firstTurn = false;
       }
 
-      // 注入 pending 消息
       if (pendingMessages.length > 0) {
         for (const message of pendingMessages) {
           await emit({ type: "message_start", message });
@@ -111,17 +124,14 @@ async function runLoop(
         pendingMessages = [];
       }
 
-      // 流式获取 assistant 响应
       const message = await streamAssistantResponse(currentContext, config, signal, emit);
       newMessages.push(message);
 
       if (message.stopReason === "error" || message.stopReason === "aborted") {
         await emit({ type: "turn_end", message, toolResults: [] });
-        await emit({ type: "agent_end", messages: newMessages });
         return;
       }
 
-      // 检查工具调用
       const toolCalls = message.content.filter(
         (c): c is ToolCallContent => c.type === "toolCall",
       );
@@ -151,14 +161,12 @@ async function runLoop(
       await emit({ type: "turn_end", message, toolResults });
 
       if (signal?.aborted) {
-        await emit({ type: "agent_end", messages: newMessages });
         return;
       }
 
       pendingMessages = (await config.getSteeringMessages?.()) ?? [];
     }
 
-    // 检查 follow-up 消息
     const followUpMessages = (await config.getFollowUpMessages?.()) ?? [];
     if (followUpMessages.length > 0) {
       pendingMessages = followUpMessages;
@@ -167,46 +175,51 @@ async function runLoop(
 
     break;
   }
-
-  await emit({ type: "agent_end", messages: newMessages });
 }
 
-/**
- * 流式获取 LLM 响应。
- */
 async function streamAssistantResponse(
   context: AgentContext,
   config: AgentLoopConfig,
   signal: AbortSignal | undefined,
   emit: EventSink,
 ): Promise<AssistantMessage> {
-  // 应用上下文变换，并写回 context.messages
+  // Emit context event for plugins to inspect (pi-mono style)
+  const usage = estimateContextUsage(context.messages, context.systemPrompt, context.model.contextWindow);
+  await emit({ type: "context", usage });
+
+  // Auto-compaction when context exceeds threshold (pi-mono style)
+  const reserveTokens = config.reserveTokens ?? DEFAULT_RESERVE_TOKENS;
+  if (shouldCompact(usage, reserveTokens)) {
+    const cutPoint = findCutPoint(context.messages, config.keepRecentTokens ?? DEFAULT_COMPACTION_CONFIG.keepRecentTokens);
+    if (cutPoint) {
+      const compacted = buildCompactedMessages(context.messages, cutPoint, "[Auto-compaction triggered]", context.systemPrompt);
+      context.messages.length = 0;
+      context.messages.push(...compacted);
+      await emit({ type: "notification", message: `Auto-compacted: kept ${compacted.length} messages (${cutPoint.truncatedCount} compressed)`, level: "info" });
+    }
+  }
+
   if (config.transformContext) {
     const transformed = await config.transformContext(context.messages, signal);
     if (transformed !== context.messages) {
-      // replace context.messages 的内容
       context.messages.length = 0;
       context.messages.push(...transformed);
     }
   }
   const messages = context.messages;
 
-  // 转换为 LLM 消息
   const llmMessages = await config.convertToLlm(messages);
 
-  // 构建工具描述
-  const toolDescriptors = (context.tools ?? []).map((t) => ({
+  const toolDescriptors = (context.tools ?? []).map((t: { name: string; description: string; parameters: unknown }) => ({
     name: t.name,
     description: t.description,
     parameters: t.parameters,
   }));
 
-  // 解析 API key
   const apiKey = config.getApiKey
     ? await config.getApiKey(config.model.provider)
     : config.model.apiKey;
 
-  // 调用 LLM
   const stream = config.streamLLM
     ? config.streamLLM(
         config.model,
@@ -227,9 +240,8 @@ async function streamAssistantResponse(
   let textBuffer = "";
   let stopReason: AssistantMessage["stopReason"] = "stop";
   let errorMessage: string | undefined;
-  let usage = { input: 0, output: 0, totalTokens: 0 };
+  let tokenUsage: TokenUsage = { input: 0, output: 0, totalTokens: 0 };
 
-  // 创建 partial message 并发送 message_start
   const partialMessage: AssistantMessage = {
     role: "assistant",
     content: [],
@@ -254,7 +266,6 @@ async function streamAssistantResponse(
         break;
 
       case "reasoning_delta":
-        // thinking/reasoning 内容：累积但不参与最终消息 content
         partialMessage.reasoning = (partialMessage.reasoning ?? "") + event.delta;
         await emit({
           type: "message_update",
@@ -265,7 +276,6 @@ async function streamAssistantResponse(
 
       case "tool_call":
         if (event.toolCall) {
-          // 先保存当前文本块
           if (textBuffer) {
             contentBlocks.push({ type: "text", text: textBuffer });
             textBuffer = "";
@@ -283,7 +293,13 @@ async function streamAssistantResponse(
 
       case "done":
         if (event.usage) {
-          usage = event.usage;
+          tokenUsage = event.usage;
+        }
+        // 使用 provider 返回的 finish_reason
+        if (event.finishReason === "length") {
+          stopReason = "length";
+        } else if (event.finishReason === "tool_calls") {
+          stopReason = "tool_use";
         }
         break;
 
@@ -294,12 +310,10 @@ async function streamAssistantResponse(
     }
   }
 
-  // 最终化消息
   if (textBuffer) {
     contentBlocks.push({ type: "text", text: textBuffer });
   }
 
-  // 如果有 tool_call 事件但没有 error，设置 stopReason
   if (contentBlocks.some((c) => c.type === "toolCall") && stopReason !== "error") {
     stopReason = "tool_use";
   }
@@ -312,16 +326,12 @@ async function streamAssistantResponse(
     stopReason,
     errorMessage,
     timestamp: Date.now(),
-    usage,
+    usage: tokenUsage,
   };
 
   await emit({ type: "message_end", message: finalMessage });
   return finalMessage;
 }
-
-// ============================================================================
-// 工具执行
-// ============================================================================
 
 interface ExecutedToolBatch {
   messages: ToolResultMessage[];
@@ -339,9 +349,8 @@ async function executeToolCalls(
     (c): c is ToolCallContent => c.type === "toolCall",
   );
 
-  // 检查是否有 sequential 工具
-  const hasSequential = toolCalls.some((tc) => {
-    const tool = currentContext.tools?.find((t) => t.name === tc.name);
+  const hasSequential = toolCalls.some((tc: ToolCallContent) => {
+    const tool = currentContext.tools?.find((t: AgentTool) => t.name === tc.name);
     return tool?.executionMode === "sequential";
   });
 
@@ -382,10 +391,10 @@ async function executeParallel(
     toolCalls.map((tc) => executeSingleToolCall(context, tc, config, signal, emit)),
   );
 
-  const messages: ToolResultMessage[] = results.map((r) => r.message);
-  const terminate = results.some((r) => r.terminate);
-
-  return { messages, terminate };
+  return {
+    messages: results.map((r) => r.message),
+    terminate: results.some((r) => r.terminate),
+  };
 }
 
 async function executeSingleToolCall(
@@ -402,7 +411,7 @@ async function executeSingleToolCall(
     args: toolCall.arguments,
   });
 
-  const tool = context.tools?.find((t) => t.name === toolCall.name);
+  const tool = context.tools?.find((t: AgentTool) => t.name === toolCall.name);
 
   if (!tool) {
     const errorMsg: ToolResultContent = {
@@ -424,7 +433,6 @@ async function executeSingleToolCall(
     };
   }
 
-  // beforeToolCall 钩子
   if (config.beforeToolCall) {
     const beforeResult = await config.beforeToolCall(
       { toolCall, args: toolCall.arguments, context },
@@ -451,12 +459,11 @@ async function executeSingleToolCall(
     }
   }
 
-  // 执行工具
   let result: AgentToolResult;
   let isError = false;
 
   try {
-    result = await tool.execute(toolCall.id, toolCall.arguments, signal, (partial) => {
+    result = await tool.execute(toolCall.id, toolCall.arguments, signal, (partial: unknown) => {
       emit({
         type: "tool_execution_update",
         toolCallId: toolCall.id,
@@ -471,7 +478,6 @@ async function executeSingleToolCall(
     };
   }
 
-  // afterToolCall 钩子
   if (config.afterToolCall) {
     const afterResult = await config.afterToolCall(
       { toolCall, args: toolCall.arguments, result, isError, context },

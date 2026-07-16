@@ -1,384 +1,419 @@
 /**
- * Agent 类 - 状态管理和事件流
+ * Agent — 封装 runAgentLoop 的高层会话管理
  *
- * 参考 pi-mono 的 Agent 类设计：
- * - 拥有消息历史和状态
- * - 发射生命周期事件
- * - 执行工具
- * - 支持 steering 和 follow-up 消息队列
- *
- * 参考 openwiki 的 runOpenWikiAgent 模式，提供简单的 prompt/continue 接口。
+ * 参考 pi-mono AgentSession 设计：
+ * - Agent.agentLoop(input) → 内部的 runAgentLoop() 真正调用 LLM
+ * - 完整生命周期事件 (agent_start → turn_start → message_* → turn_end → agent_end)
+ * - abort() 中断当前循环
+ * - subscribe() 事件监听
  */
 
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.js";
-import { convertToLlm } from "./llm.js";
 import type {
-  AgentContext,
   AgentEvent,
-  AgentLoopConfig,
   AgentMessage,
   AgentState,
   AgentTool,
-  ImageContent,
-  Message,
+  AgentConfig,
   ModelConfig,
+  AgentLoopConfig,
+  AssistantMessage,
   StreamLLM,
-  TextContent,
-  ThinkingLevel,
 } from "./types.js";
+import { runAgentLoop } from "./agent-loop.js";
+import { convertToLlm } from "./llm.js";
+import { streamOpenAI } from "./providers/openai.js";
+import type { StreamFn } from "./llm.js";
+import {
+  estimateContextUsage,
+  shouldCompact,
+  DEFAULT_RESERVE_TOKENS,
+  DEFAULT_CONTEXT_WINDOW,
+} from "./token-estimate.js";
+import {
+  findCutPoint,
+  buildCompactedMessages,
+  buildCompactionPrompt,
+  type CompactionConfig,
+  type CutPoint,
+  DEFAULT_COMPACTION_CONFIG,
+} from "./compaction.js";
 
-const EMPTY_USAGE = { input: 0, output: 0, totalTokens: 0 };
-
-const DEFAULT_MODEL: ModelConfig = {
-  id: "gpt-4o",
-  name: "gpt-4o",
-  provider: "openai",
-};
-
-interface PendingMessageQueue {
-  messages: AgentMessage[];
-  mode: "all" | "one-at-a-time";
-}
-
-function createQueue(mode: "all" | "one-at-a-time" = "one-at-a-time"): PendingMessageQueue {
-  return { messages: [], mode };
-}
-
-function drainQueue(queue: PendingMessageQueue): AgentMessage[] {
-  if (queue.mode === "all") {
-    const drained = queue.messages.slice();
-    queue.messages = [];
-    return drained;
-  }
-  const first = queue.messages[0];
-  if (!first) return [];
-  queue.messages = queue.messages.slice(1);
-  return [first];
-}
-
-export interface AgentOptions {
-  initialState?: {
-    systemPrompt?: string;
-    model?: ModelConfig;
-    thinkingLevel?: ThinkingLevel;
-    tools?: AgentTool[];
-    messages?: AgentMessage[];
-  };
-  convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-  streamLLM?: StreamLLM;
-  transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
-  getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
-  toolExecution?: "sequential" | "parallel";
-  beforeToolCall?: AgentLoopConfig["beforeToolCall"];
-  afterToolCall?: AgentLoopConfig["afterToolCall"];
-  steeringMode?: "all" | "one-at-a-time";
-  followUpMode?: "all" | "one-at-a-time";
-  /** Session 持久化回调：每条消息结束时保存 */
-  onMessageEnd?: (message: AgentMessage) => Promise<void>;
-  /** Session 持久化回调：session 重置 */
-  onSessionReset?: () => Promise<void>;
-}
+const DEFAULT_MODEL: ModelConfig = { id: "gpt-4o", name: "gpt-4o", provider: "openai" };
 
 export class Agent {
-  private _systemPrompt: string;
-  private _model: ModelConfig;
-  private _thinkingLevel: ThinkingLevel;
-  private _tools: AgentTool[];
-  private _messages: AgentMessage[];
+  private _systemPrompt = "You are a helpful coding assistant.";
+  private _model = DEFAULT_MODEL;
+  private _tools: AgentTool[] = [];
+  private _messages: AgentMessage[] = [];
   private _isStreaming = false;
-  private _streamingMessage: AgentMessage | undefined;
-  private _pendingToolCalls = new Set<string>();
   private _errorMessage: string | undefined;
+  private _abortController = new AbortController();
+  private _idleResolvers: Array<() => void> = [];
+  private _agentEndEmitted = false;
 
-  private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
-  private readonly steeringQueue: PendingMessageQueue;
-  private readonly followUpQueue: PendingMessageQueue;
+  /** 外部传入的 streamLLM provider，默认用 streamOpenAI */
+  private _streamLLM: StreamFn;
 
-  private activeRun?: {
-    promise: Promise<void>;
-    resolve: () => void;
-    abortController: AbortController;
-  };
+  /** Compaction 完成后的回调，用于持久化 CompactionEntry */
+  private _onCompaction?: (summary: string, cutPoint: CutPoint, keptMessages: AgentMessage[]) => Promise<void>;
 
-  public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-  public streamLLM?: StreamLLM;
-  public transformContext?: AgentLoopConfig["transformContext"];
-  public getApiKey?: AgentLoopConfig["getApiKey"];
-  public toolExecution: "sequential" | "parallel";
-  public beforeToolCall?: AgentLoopConfig["beforeToolCall"];
-  public afterToolCall?: AgentLoopConfig["afterToolCall"];
-  public onMessageEnd?: (message: AgentMessage) => Promise<void>;
-  public onSessionReset?: () => Promise<void>;
+  readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 
-  constructor(options: AgentOptions = {}) {
-    const state = options.initialState ?? {};
-    this._systemPrompt = state.systemPrompt ?? "You are a helpful coding assistant.";
-    this._model = state.model ?? DEFAULT_MODEL;
-    this._thinkingLevel = state.thinkingLevel ?? "off";
-    this._tools = state.tools?.slice() ?? [];
-    this._messages = state.messages?.slice() ?? [];
-    this.convertToLlm = options.convertToLlm ?? convertToLlm;
-    this.streamLLM = options.streamLLM;
-    this.transformContext = options.transformContext;
-    this.getApiKey = options.getApiKey;
-    this.toolExecution = options.toolExecution ?? "parallel";
-    this.beforeToolCall = options.beforeToolCall;
-    this.afterToolCall = options.afterToolCall;
-    this.onMessageEnd = options.onMessageEnd;
-    this.onSessionReset = options.onSessionReset;
-    this.steeringQueue = createQueue(options.steeringMode ?? "one-at-a-time");
-    this.followUpQueue = createQueue(options.followUpMode ?? "one-at-a-time");
+  constructor(config?: AgentConfig) {
+    if (config?.systemPrompt) this._systemPrompt = config.systemPrompt;
+    if (config?.model) this._model = config.model;
+    if (config?.tools) this._tools = config.tools.slice();
+    if (config?.messages) this._messages = config.messages.slice();
+    this._streamLLM = config?.streamLLM ?? (async function* () {} as StreamFn);
+    this._onCompaction = config?.onCompaction;
   }
 
   get state(): AgentState {
     return {
       systemPrompt: this._systemPrompt,
       model: this._model,
-      thinkingLevel: this._thinkingLevel,
       tools: this._tools,
       messages: this._messages,
       isStreaming: this._isStreaming,
-      streamingMessage: this._streamingMessage,
-      pendingToolCalls: this._pendingToolCalls,
       errorMessage: this._errorMessage,
+      messageCount: this._messages.length,
     };
   }
 
   set systemPrompt(value: string) { this._systemPrompt = value; }
   set model(value: ModelConfig) { this._model = value; }
-  set thinkingLevel(value: ThinkingLevel) { this._thinkingLevel = value; }
   set tools(value: AgentTool[]) { this._tools = value.slice(); }
-
-  set steeringMode(mode: "all" | "one-at-a-time") { this.steeringQueue.mode = mode; }
-  set followUpMode(mode: "all" | "one-at-a-time") { this.followUpQueue.mode = mode; }
 
   subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  steer(message: AgentMessage): void { this.steeringQueue.messages.push(message); }
-  followUp(message: AgentMessage): void { this.followUpQueue.messages.push(message); }
-  clearSteeringQueue(): void { this.steeringQueue.messages = []; }
-  clearFollowUpQueue(): void { this.followUpQueue.messages = []; }
-  clearAllQueues(): void { this.clearSteeringQueue(); this.clearFollowUpQueue(); }
-
-  /** 加载消息（替换当前消息列表） */
   loadMessages(messages: AgentMessage[]): void {
     this._messages = messages.slice();
-    this._errorMessage = undefined;
-    this._streamingMessage = undefined;
   }
 
-  abort(): void { this.activeRun?.abortController.abort(); }
-  waitForIdle(): Promise<void> { return this.activeRun?.promise ?? Promise.resolve(); }
+  abort(): void {
+    this._errorMessage = "Aborted";
+    this._abortController.abort("user_cancelled");
+  }
 
-  /** 向 TUI 发送通知消息（通过 listeners 广播 notification 事件）。 */
-  notifyUI(message: string, level: "info" | "warning" | "error" = "info"): void {
-    const event: AgentEvent = { type: "notification", message, level };
-    for (const listener of this.listeners) {
-      const result = listener(event, new AbortController().signal);
-      if (result && typeof result === "object" && "catch" in result) {
-        (result as Promise<void>).catch(() => {});
-      }
-    }
+  waitForIdle(): Promise<void> {
+    if (!this._isStreaming || this._abortController.signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      this._idleResolvers.push(resolve);
+    });
   }
 
   reset(): void {
+    // 清理旧的 AbortController 避免 listeners 泄漏
+    if (!this._abortController.signal.aborted) {
+      this._abortController.abort("reset");
+    }
     this._messages = [];
     this._isStreaming = false;
-    this._streamingMessage = undefined;
-    this._pendingToolCalls = new Set();
     this._errorMessage = undefined;
-    this.clearAllQueues();
-    this.onSessionReset?.().catch(() => {});
+    this._abortController = new AbortController();
+    this._agentEndEmitted = false;
   }
 
-  async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
-  async prompt(input: string, images?: ImageContent[]): Promise<void>;
-  async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
-    if (this.activeRun) {
-      throw new Error("Agent is already processing. Use steer() or followUp() to queue messages.");
-    }
-    const messages = this.normalizePromptInput(input, images);
-    await this.runWithLifecycle(async (signal) => {
-      await runAgentLoop(
-        messages,
-        this.createContextSnapshot(),
-        this.createLoopConfig(),
-        (event) => this.processEvents(event),
-        signal,
-      );
+  notifyUI(message: string, level: "info" | "warning" | "error" = "info"): void {
+    this.broadcast({ type: "notification", message, level });
+  }
+
+  /**
+   * 构建 AgentLoopConfig，供 agentLoop 使用。
+   * 子类可重写此方法自定义 config。
+   */
+  /** 获取当前消息列表（请勿直接修改返回的数组） */
+  getMessages(): AgentMessage[] {
+    return this._messages;
+  }
+
+  /** 设置消息列表（用于 session 切换/上下文重建） */
+  setMessages(messages: AgentMessage[]): void {
+    this._messages = messages.slice();
+    // 触发重新渲染
+    this.broadcast({
+      type: "notification",
+      message: `Context updated (${messages.length} messages)`,
+      level: "info",
     });
   }
 
-  async continue(): Promise<void> {
-    if (this.activeRun) {
-      throw new Error("Agent is already processing. Wait for completion before continuing.");
-    }
-    const lastMessage = this._messages[this._messages.length - 1];
-    if (!lastMessage) throw new Error("No messages to continue from");
-    if (lastMessage.role === "assistant") {
-      const queued = drainQueue(this.steeringQueue);
-      if (queued.length > 0) {
-        await this.runWithLifecycle(async (signal) => {
-          await runAgentLoop(
-            queued,
-            this.createContextSnapshot(),
-            this.createLoopConfig(),
-            (event) => this.processEvents(event),
-            signal,
-          );
-        });
-        return;
-      }
-      const followUps = drainQueue(this.followUpQueue);
-      if (followUps.length > 0) {
-        await this.runWithLifecycle(async (signal) => {
-          await runAgentLoop(
-            followUps,
-            this.createContextSnapshot(),
-            this.createLoopConfig(),
-            (event) => this.processEvents(event),
-            signal,
-          );
-        });
-        return;
-      }
-      throw new Error("Cannot continue from message role: assistant");
-    }
-    await this.runWithLifecycle(async (signal) => {
-      await runAgentLoopContinue(
-        this.createContextSnapshot(),
-        this.createLoopConfig(),
-        (event) => this.processEvents(event),
-        signal,
-      );
-    });
+  /**
+   * 设置 compaction 持久化回调（由 cli.ts 注入 session-manager）。
+   */
+  setCompactionCallback(cb: (summary: string, cutPoint: CutPoint, keptMessages: AgentMessage[]) => Promise<void>): void {
+    this._onCompaction = cb;
   }
 
-  private normalizePromptInput(
-    input: string | AgentMessage | AgentMessage[],
-    images?: ImageContent[],
-  ): AgentMessage[] {
-    if (Array.isArray(input)) return input;
-    if (typeof input !== "string") return [input];
-    const content: Array<TextContent | ImageContent> = [{ type: "text", text: input }];
-    if (images && images.length > 0) content.push(...images);
-    return [{ role: "user", content, timestamp: Date.now() }];
-  }
-
-  private createContextSnapshot(): AgentContext {
-    return {
-      systemPrompt: this._systemPrompt,
-      messages: this._messages.slice(),
-      tools: this._tools.slice(),
-    };
-  }
-
-  private createLoopConfig(): AgentLoopConfig {
+  protected buildLoopConfig(): AgentLoopConfig {
+    const userStream = this._streamLLM;
+    const streamFn = userStream ?? streamOpenAI;
     return {
       model: this._model,
-      streamLLM: this.streamLLM,
-      convertToLlm: this.convertToLlm,
-      transformContext: this.transformContext,
-      getApiKey: this.getApiKey,
-      toolExecution: this.toolExecution,
-      beforeToolCall: this.beforeToolCall,
-      afterToolCall: this.afterToolCall,
-      getSteeringMessages: async () => drainQueue(this.steeringQueue),
-      getFollowUpMessages: async () => drainQueue(this.followUpQueue),
+      convertToLlm,
+      streamLLM: streamFn as StreamLLM,
+      toolExecution: "parallel",
     };
   }
 
-  private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
-    if (this.activeRun) throw new Error("Agent is already processing.");
-
-    const abortController = new AbortController();
-    let resolvePromise = () => {};
-    const promise = new Promise<void>((resolve) => { resolvePromise = resolve; });
-    this.activeRun = { promise, resolve: resolvePromise, abortController };
+  /**
+   * Main agent loop — 封装 runAgentLoop，真正调用 LLM。
+   * 参考 pi-mono AgentSession.prompt()。
+   */
+  async agentLoop(input: string): Promise<void> {
+    if (this._isStreaming) {
+      throw new Error("Agent is already streaming");
+    }
 
     this._isStreaming = true;
-    this._streamingMessage = undefined;
+    this._errorMessage = undefined;
+    this._agentEndEmitted = false;  // 重置，允许本次 agentLoop 发出 agent_end
+    // 清理旧的 AbortController 避免 listeners 泄漏
+    if (!this._abortController.signal.aborted) {
+      this._abortController.abort("new_loop");
+    }
+    this._abortController = new AbortController();
+
+    try {
+      // Add user message (但不 push 到 this._messages，由 runAgentLoop 返回后再合并)
+      const userMsg: AgentMessage = {
+        role: "user",
+        content: [{ type: "text" as const, text: input }],
+        timestamp: Date.now(),
+      };
+
+      // Build loop config
+      const loopConfig = this.buildLoopConfig();
+
+      // 构建 context（引用 this._messages，runAgentLoop 会修改它）
+      const context = {
+        model: this._model,
+        systemPrompt: this._systemPrompt,
+        tools: this._tools,
+        messages: this._messages,
+      };
+
+      // 调用 runAgentLoop — 真正的 LLM 驱动循环
+      const allMessages = await runAgentLoop(
+        [userMsg],
+        context,
+        loopConfig,
+        (event) => this.broadcast(event),
+        this._abortController.signal,
+      );
+
+      // allMessages = [userMsg, assistantMsg, toolResult...] (不含历史)
+      // 合并历史 + 新消息
+      this._messages = [...context.messages, ...allMessages];
+
+      // Agent end
+      await this.broadcast({ type: "agent_end", messages: this._messages });
+
+      // 自动压缩：用完 Agent Loop 后检查 context 使用量
+      await this.autoCompactIfNeeded();
+
+    } catch (err) {
+      if (this._abortController.signal.aborted) {
+        this._errorMessage = "Aborted";
+        // 中断路径也发 agent_end，确保 UI 恢复 idle 且消息保存
+        await this.broadcast({ type: "agent_end", messages: this._messages });
+      } else {
+        this._errorMessage = err instanceof Error ? err.message : String(err);
+        this.notifyUI(this._errorMessage, "error");
+        // 异常路径下发 agent_end
+        await this.broadcast({ type: "agent_end", messages: this._messages });
+      }
+    } finally {
+      this._isStreaming = false;
+      const resolvers = this._idleResolvers;
+      this._idleResolvers = [];
+      resolvers.forEach((r) => r());
+    }
+  }
+
+  /**
+   * Simple prompt (single turn, no agent events).
+   * 非交互模式用，直接调用 runAgentLoop 的简化版本。
+   */
+  async prompt(input: string): Promise<AssistantMessage | null> {
+    if (this._isStreaming) {
+      throw new Error("Agent is already streaming");
+    }
+
+    this._isStreaming = true;
     this._errorMessage = undefined;
 
     try {
-      await executor(abortController.signal);
-    } catch (error) {
-      await this.handleRunFailure(error, abortController.signal.aborted);
+      const userMsg: AgentMessage = {
+        role: "user",
+        content: [{ type: "text" as const, text: input }],
+        timestamp: Date.now(),
+      };
+
+      const loopConfig = this.buildLoopConfig();
+      const context = {
+        model: this._model,
+        systemPrompt: this._systemPrompt,
+        tools: this._tools,
+        messages: this._messages,
+      };
+
+      const messages = await runAgentLoop(
+        [userMsg],
+        {
+          model: this._model,
+          systemPrompt: this._systemPrompt,
+          tools: this._tools,
+          messages: this._messages,
+        },
+        loopConfig,
+        () => {}, // no events in print mode
+        this._abortController.signal,
+      );
+
+      // 保存上下文历史 — 直接在 this._messages 上追加
+      this._messages.push(...messages);
+
+      // Find the last assistant message
+      const lastAssistant = messages
+        .filter((m): m is AssistantMessage => m.role === "assistant")
+        .pop();
+
+      return lastAssistant ?? null;
+    } catch (err) {
+      this._errorMessage = err instanceof Error ? err.message : String(err);
+      return null;
     } finally {
-      this.finishRun();
+      this._isStreaming = false;
+      const resolvers = this._idleResolvers;
+      this._idleResolvers = [];
+      resolvers.forEach((r) => r());
     }
   }
 
-  private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
-    const failureMessage: AgentMessage = {
-      role: "assistant",
-      content: [{ type: "text", text: "" }],
-      model: this._model.id,
-      provider: this._model.provider,
-      stopReason: aborted ? "aborted" : "error",
-      errorMessage: error instanceof Error ? error.message : String(error),
-      timestamp: Date.now(),
-      usage: EMPTY_USAGE,
-    };
-    await this.processEvents({ type: "message_start", message: failureMessage });
-    await this.processEvents({ type: "message_end", message: failureMessage });
-    await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
-    await this.processEvents({ type: "agent_end", messages: [failureMessage] });
-  }
+  // ============================================================================
+  // Compaction
+  // ============================================================================
 
-  private finishRun(): void {
-    this._isStreaming = false;
-    this._streamingMessage = undefined;
-    this._pendingToolCalls = new Set();
-    this.activeRun?.resolve();
-    this.activeRun = undefined;
-  }
+  /**
+   * 检查 context 使用量，超过阈值时自动触发 LLM 驱动的压缩。
+   * 发送压缩 prompt 给 LLM，用返回的摘要替换早期消息。
+   */
+  private async autoCompactIfNeeded(): Promise<void> {
+    if (this._messages.length === 0) return;
 
-  private async processEvents(event: AgentEvent): Promise<void> {
-    switch (event.type) {
-      case "message_start":
-        this._streamingMessage = event.message;
-        break;
-      case "message_update":
-        this._streamingMessage = event.message;
-        break;
-      case "message_end":
-        this._streamingMessage = undefined;
-        this._messages.push(event.message);
-        this.onMessageEnd?.(event.message).catch(() => {});
-        break;
-      case "tool_execution_start": {
-        const next = new Set(this._pendingToolCalls);
-        next.add(event.toolCallId);
-        this._pendingToolCalls = next;
-        break;
-      }
-      case "tool_execution_end": {
-        const next = new Set(this._pendingToolCalls);
-        next.delete(event.toolCallId);
-        this._pendingToolCalls = next;
-        break;
-      }
-      case "turn_end":
-        if (event.message.role === "assistant" && event.message.errorMessage) {
-          this._errorMessage = event.message.errorMessage;
+    const usage = estimateContextUsage(
+      this._messages,
+      this._systemPrompt,
+      this._model.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    );
+
+    const reserveTokens = DEFAULT_RESERVE_TOKENS;
+    if (!shouldCompact(usage, reserveTokens)) return;
+
+    const cutPoint = findCutPoint(this._messages, DEFAULT_COMPACTION_CONFIG.keepRecentTokens);
+    if (!cutPoint) return;
+
+    this.notifyUI(`Auto-compacting context (${cutPoint.truncatedCount} messages)...`, "info");
+
+    try {
+      // 构建压缩 prompt
+      const messagesToSummarize = this._messages.slice(0, cutPoint.firstKeptIndex);
+      const prompt = buildCompactionPrompt({
+        messagesToSummarize,
+        keptMessages: this._messages.slice(cutPoint.firstKeptIndex),
+        instructions: "Summarize the compressed messages, preserving key decisions, file changes, and action items.",
+      });
+
+      // 发一次 LLM 调用获取摘要
+      const summary = await this.summarizeWithLLM(prompt);
+      if (!summary) return;
+
+      // 构建压缩后的消息列表
+      const compacted = buildCompactedMessages(
+        this._messages,
+        cutPoint,
+        summary,
+        this._systemPrompt,
+      );
+
+      // 持久化 CompactionEntry（通过回调注入 session-manager）
+      if (this._onCompaction) {
+        try {
+          await this._onCompaction(summary, cutPoint, compacted);
+        } catch (err) {
+          this.notifyUI(`Compaction persistence failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
         }
-        break;
-      case "agent_end":
-        this._streamingMessage = undefined;
-        break;
+      }
+
+      this._messages = compacted;
+      this.notifyUI(`Auto-compacted: ${cutPoint.truncatedCount} messages compressed → ${compacted.length} messages kept`, "info");
+    } catch (err) {
+      this.notifyUI(`Auto-compaction failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
+    }
+  }
+
+  /**
+   * 用 LLM 对给定 prompt 生成摘要回复。
+   * 使用当前配置的 model + streamLLM。
+   */
+  private async summarizeWithLLM(prompt: string): Promise<string | null> {
+    const loopConfig = this.buildLoopConfig();
+    const llmMessages = await convertToLlm([
+      {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: prompt }],
+        timestamp: Date.now(),
+      },
+    ]);
+
+    const stream = loopConfig.streamLLM
+      ? loopConfig.streamLLM(
+          this._model,
+          llmMessages,
+          "",  // 不需要 system prompt
+          [],  // 不需要工具
+          { signal: new AbortController().signal },
+        )
+      : streamOpenAI(
+          this._model,
+          llmMessages,
+          "",
+          [],
+          { signal: new AbortController().signal },
+        );
+
+    let textBuffer = "";
+    for await (const event of stream) {
+      if (event.type === "text_delta") {
+        textBuffer += event.delta;
+      }
+      if (event.type === "error") {
+        return null;
+      }
     }
 
-    const signal = this.activeRun?.abortController.signal;
-    if (!signal) throw new Error("Agent listener invoked outside active run");
-    for (const listener of this.listeners) {
+    return textBuffer || null;
+  }
+
+  // ============================================================================
+  // Private
+  // ============================================================================
+
+  private async broadcast(event: AgentEvent): Promise<void> {
+    // 防止重复 agent_end
+    if (event.type === "agent_end") {
+      if (this._agentEndEmitted) return;
+      this._agentEndEmitted = true;
+    }
+    for (const l of this.listeners) {
       try {
-        await listener(event, signal);
-      } catch (err) {
-        console.error(`[Agent] listener error:`, err);
+        await l(event, this._abortController.signal);
+      } catch {
+        // ignore listener errors
       }
     }
   }

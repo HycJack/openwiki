@@ -1,28 +1,27 @@
 /**
- * 插件运行器 - 管理插件生命周期和事件分发
+ * Plugin Runner — 事件分发 + Slot API 绑定
  *
- * 参考 pi-mono 的 extensions/runner.ts 设计：
- * - bindCore() 绑定核心操作方法
- * - emit() 分发事件到所有插件的处理器
- * - getRegisteredTools() 收集所有插件注册的工具
- * - getRegisteredCommands() 收集所有插件注册的命令
+ * 参考 pi-mono ExtensionRunner:
+ * - 事件分发到所有插件的 handlers
+ * - bindSlotAPI() 注入 TUI 操作
+ * - createContext() 构建含 ui 的 PluginContext
+ * - 支持热重载 (reloadPlugins)
  */
 
-import type { AgentTool, AgentEvent, ModelConfig } from "../types.js";
+import type { Component } from "@earendil-works/pi-tui";
 import type {
-  Plugin,
-  PluginAPI,
-  PluginCommand,
-  PluginCommandContext,
-  PluginContext,
-  PluginLoadResult,
-  PluginRuntime,
-} from "./types.js";
+  AgentTool, AgentEvent, ModelConfig, WidgetPlacement,
+  PluginUIContext, Plugin, PluginCommand, PluginCommandContext,
+  PluginContext, PluginLoadResult, PluginRuntime,
+} from "../types.js";
+import type { ContextUsage } from "../token-estimate.js";
 
-export interface PluginRunnerOptions {
-  cwd: string;
-  model?: ModelConfig;
-  systemPrompt: string;
+export interface TuiSlotAPI {
+  setHeader(content: string[] | undefined, component?: Component): void;
+  setFooter(content: string[] | undefined, component?: Component): void;
+  setWidget(key: string, content: string[] | undefined, options?: { placement?: WidgetPlacement; component?: Component }): void;
+  setStatus(key: string, text: string | undefined): void;
+  setTitle(title: string): void;
 }
 
 export class PluginRunner {
@@ -31,15 +30,20 @@ export class PluginRunner {
   private cwd: string;
   private model: ModelConfig | undefined;
   private systemPrompt: string;
-  private isIdleFn: () => boolean = () => true;
-  private abortFn: () => void = () => {};
-  private waitForIdleFn: () => Promise<void> = async () => {};
-  private sendMessageFn: (content: string) => void = () => {};
-  private compactFn: (options?: { customInstructions?: string }) => void = () => {};
-  private getContextUsageFn: () => { tokens: number; limit: number; percent: number } | null = () => null;
+  private isIdleFn = () => true;
+  private abortFn = () => {};
+  private waitForIdleFn = async () => {};
+  private sendMessageFn = (_: string) => {};
+  private getContextUsageFn: () => ContextUsage | null = () => null;
+  private compactFn: (options?: { instructions?: string }) => void = () => {};
   private getMessageCountFn: () => number = () => 0;
+  private slotAPI: TuiSlotAPI | null = null;
 
-  constructor(plugins: Plugin[], runtime: PluginRuntime, options: PluginRunnerOptions) {
+  constructor(
+    plugins: Plugin[],
+    runtime: PluginRuntime,
+    options: { cwd: string; model?: ModelConfig; systemPrompt: string },
+  ) {
     this.plugins = plugins;
     this.runtime = runtime;
     this.cwd = options.cwd;
@@ -47,70 +51,62 @@ export class PluginRunner {
     this.systemPrompt = options.systemPrompt;
   }
 
-  /**
-   * 绑定核心操作方法。
-   */
   bindCore(actions: {
     isIdle: () => boolean;
     abort: () => void;
     waitForIdle: () => Promise<void>;
-    sendMessage: (content: string) => void;
+    sendMessage: (c: string) => void;
     getActiveTools: () => string[];
     getAllTools: () => string[];
-    setActiveTools: (toolNames: string[]) => void;
-    notify: (message: string, type?: "info" | "warning" | "error") => void;
-    compact?: (options?: { customInstructions?: string }) => void;
-    getContextUsage?: () => { tokens: number; limit: number; percent: number } | null;
+    setActiveTools: (t: string[]) => void;
+    notify: (m: string, t?: "info" | "warning" | "error") => void;
+    getContextUsage?: () => ContextUsage | null;
+    compact?: (options?: { instructions?: string }) => void;
     getMessageCount?: () => number;
   }): void {
     this.isIdleFn = actions.isIdle;
     this.abortFn = actions.abort;
     this.waitForIdleFn = actions.waitForIdle;
     this.sendMessageFn = actions.sendMessage;
-
-    // 替换 runtime 中的 stub 方法
     this.runtime.sendMessage = actions.sendMessage;
     this.runtime.getActiveTools = actions.getActiveTools;
     this.runtime.getAllTools = actions.getAllTools;
     this.runtime.setActiveTools = actions.setActiveTools;
     this.runtime.notify = actions.notify;
-
-    if (actions.compact) this.compactFn = actions.compact;
     if (actions.getContextUsage) this.getContextUsageFn = actions.getContextUsage;
+    if (actions.compact) this.compactFn = actions.compact;
     if (actions.getMessageCount) this.getMessageCountFn = actions.getMessageCount;
   }
 
-  hasHandlers(eventType: string): boolean {
-    for (const plugin of this.plugins) {
-      const handlers = plugin.handlers.get(eventType);
-      if (handlers && handlers.length > 0) return true;
-    }
-    return false;
+  bindSlotAPI(slotAPI: TuiSlotAPI): void {
+    this.slotAPI = slotAPI;
+    this.runtime.setStatus = (k, t) => slotAPI.setStatus(k, t);
+    this.runtime.setWidget = (k, c, o) => slotAPI.setWidget(k, c, o);
+    this.runtime.setHeader = (c, co) => slotAPI.setHeader(c, co);
+    this.runtime.setFooter = (c, co) => slotAPI.setFooter(c, co);
+    this.runtime.setTitle = (t) => slotAPI.setTitle(t);
   }
 
-  /**
-   * 分发事件到所有插件，事件处理器接收 (event, context) 两个参数。
-   */
+  /** Emit an agent lifecycle event to all plugins */
   async emit(event: AgentEvent): Promise<void> {
-    const eventType = event.type;
     const ctx = this.createContext();
     for (const plugin of this.plugins) {
-      const handlers = plugin.handlers.get(eventType);
+      const handlers = plugin.handlers.get(event.type);
       if (!handlers) continue;
       for (const handler of handlers) {
         try {
           await handler(event, ctx);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.runtime.notify(`Plugin error in ${plugin.name}: ${message}`, "error");
+          this.runtime.notify(
+            `Plugin error in ${plugin.name}: ${err instanceof Error ? err.message : String(err)}`,
+            "error",
+          );
         }
       }
     }
   }
 
-  /**
-   * 分发自定义事件，事件处理器接收 (args..., context) 参数。
-   */
+  /** Emit a custom event (non-AgentEvent) to all plugins */
   async emitCustom(eventType: string, ...args: unknown[]): Promise<void> {
     const ctx = this.createContext();
     for (const plugin of this.plugins) {
@@ -120,112 +116,82 @@ export class PluginRunner {
         try {
           await handler(...args, ctx);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.runtime.notify(`Plugin error in ${plugin.name}: ${message}`, "error");
+          this.runtime.notify(
+            `Plugin error in ${plugin.name}: ${err instanceof Error ? err.message : String(err)}`,
+            "error",
+          );
         }
       }
     }
   }
 
-  /**
-   * 分发 context 事件，允许插件在 LLM 调用前修改消息列表。
-   * 每个插件的处理器可以返回 { messages } 来替换消息列表。
-   */
-  async emitContext(messages: unknown[]): Promise<unknown[]> {
-    const ctx = this.createContext();
-    let currentMessages = structuredClone(messages);
-
-    for (const plugin of this.plugins) {
-      const handlers = plugin.handlers.get("context");
-      if (!handlers || handlers.length === 0) continue;
-      for (const handler of handlers) {
-        try {
-          const result = await handler({ type: "context", messages: currentMessages }, ctx);
-          if (result && typeof result === "object" && "messages" in result && Array.isArray(result.messages)) {
-            currentMessages = result.messages;
-          }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.runtime.notify(`Plugin error in ${plugin.name}: ${message}`, "error");
-        }
-      }
-    }
-
-    return currentMessages;
-  }
-
-  /**
-   * 获取所有插件注册的工具（先注册的优先）。
-   */
+  /** Get all unique tools registered by plugins */
   getRegisteredTools(): AgentTool[] {
-    const toolsByName = new Map<string, AgentTool>();
-    for (const plugin of this.plugins) {
-      for (const tool of plugin.tools.values()) {
-        if (!toolsByName.has(tool.name)) {
-          toolsByName.set(tool.name, tool);
-        }
+    const byName = new Map<string, AgentTool>();
+    for (const p of this.plugins) {
+      for (const t of p.tools.values()) {
+        if (!byName.has(t.name)) byName.set(t.name, t);
       }
     }
-    return Array.from(toolsByName.values());
+    return Array.from(byName.values());
   }
 
-  /**
-   * 获取所有插件注册的命令。
-   */
+  /** Get all unique commands registered by plugins */
   getRegisteredCommands(): PluginCommand[] {
-    const commandsByName = new Map<string, PluginCommand>();
-    for (const plugin of this.plugins) {
-      for (const command of plugin.commands.values()) {
-        if (!commandsByName.has(command.name)) {
-          commandsByName.set(command.name, command);
-        }
+    const byName = new Map<string, PluginCommand>();
+    for (const p of this.plugins) {
+      for (const c of p.commands.values()) {
+        if (!byName.has(c.name)) byName.set(c.name, c);
       }
     }
-    return Array.from(commandsByName.values());
+    return Array.from(byName.values());
   }
 
-  /**
-   * 创建插件上下文（用于事件处理）。
-   */
+  /** Create a PluginContext for event handlers */
   createContext(): PluginContext {
-    const self = this;
+    const ui: PluginUIContext = {
+      notify: (m, t) => this.runtime.notify(m, t),
+      setStatus: (k, t) => this.runtime.setStatus?.(k, t),
+      setWidget: (k, c, o) => this.runtime.setWidget?.(k, c, o),
+      setHeader: (c, co) => this.runtime.setHeader?.(c, co),
+      setFooter: (c, co) => this.runtime.setFooter?.(c, co),
+      setTitle: (t) => this.runtime.setTitle?.(t),
+    };
+
     return {
       cwd: this.cwd,
       model: this.model,
       isIdle: () => this.isIdleFn(),
       abort: () => this.abortFn(),
       getSystemPrompt: () => this.systemPrompt,
-      getContextUsage: () => self.getContextUsageFn(),
-      compact: (options) => self.compactFn(options),
-      getMessageCount: () => self.getMessageCountFn(),
+      getContextUsage: () => this.getContextUsageFn(),
+      compact: (options) => this.compactFn(options),
+      getMessageCount: () => this.getMessageCountFn(),
+      ui,
     };
   }
 
-  /**
-   * 创建命令上下文（用于命令执行）。
-   */
+  /** Create a PluginCommandContext for command handlers */
   createCommandContext(): PluginCommandContext {
+    const base = this.createContext();
     return {
-      ...this.createContext(),
+      ...base,
       waitForIdle: () => this.waitForIdleFn(),
-      sendMessage: (content) => this.sendMessageFn(content),
-      notify: (message, type) => this.runtime.notify(message, type),
+      sendMessage: (c) => this.sendMessageFn(c),
+      notify: (m, t) => this.runtime.notify(m, t),
     };
   }
 
-  /**
-   * 执行插件命令。
-   */
+  /** Execute a registered command by name */
   async executeCommand(name: string, args: string): Promise<boolean> {
     for (const plugin of this.plugins) {
-      const command = plugin.commands.get(name);
-      if (command) {
+      const cmd = plugin.commands.get(name);
+      if (cmd) {
         try {
-          await command.handler(this.createCommandContext(), args);
+          await cmd.handler(this.createCommandContext(), args);
           return true;
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          this.runtime.notify(`Command ${name} failed: ${message}`, "error");
+          this.runtime.notify(`Command ${name} failed: ${err}`, "error");
           return true;
         }
       }
@@ -237,22 +203,15 @@ export class PluginRunner {
     return this.plugins.map((p) => p.path);
   }
 
-  /**
-   * 重新加载插件列表（替换所有已加载的插件）。
-   * 调用方需要先使用 loadPlugins 或类似方法加载新插件。
-   */
   reloadPlugins(newPlugins: Plugin[]): void {
     this.plugins = newPlugins.slice();
   }
 }
 
-/**
- * 从加载结果创建 PluginRunner。
- */
 export function createPluginRunner(
   loadResult: PluginLoadResult,
   runtime: PluginRuntime,
-  options: PluginRunnerOptions,
+  options: { cwd: string; model?: ModelConfig; systemPrompt: string },
 ): PluginRunner {
   return new PluginRunner(loadResult.plugins, runtime, options);
 }

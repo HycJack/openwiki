@@ -1,236 +1,159 @@
 /**
- * Session 管理 - 消息持久化存储
+ * AgentSession — high-level session management (pi-mono AgentSession style)
  *
- * 参考 pi-mono 的 session 设计：
- * - 消息以 JSONL 格式存储
- * - 按工作目录组织
- * - 支持多会话列表、恢复、新建
- *
- * 存储路径：~/.tca/sessions/
- * 文件名：<cwd-hash>/<session-id>.jsonl
+ * 管理 agent 生命周期、插件绑定、事件分发。
+ * 参考 pi-mono's AgentSession / createAgentSession 设计。
  */
 
-import { appendFile, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-import type { AgentMessage } from "./types.js";
+import { Agent } from "./agent.js";
+import { createPluginRunner, type PluginRunner } from "./plugin/runner.js";
+import type { AgentEvent, AgentMessage, AgentSession as IAgentSession, AgentTool, ModelConfig, Plugin, PluginCommand, PluginRuntime } from "./types.js";
 
-// ============================================================================
-// 类型
-// ============================================================================
-
-export interface SessionMeta {
-  id: string;
-  cwd: string;
-  modelId: string;
-  createdAt: string;
-  updatedAt: string;
-  messageCount: number;
-  name?: string;
+export interface AgentSessionOptions {
+  cwd?: string;
+  model?: ModelConfig;
+  systemPrompt?: string;
+  tools?: AgentTool[];
 }
 
-export interface SessionInfo {
-  meta: SessionMeta;
-  filePath: string;
-}
+export class AgentSession implements IAgentSession {
+  readonly agent: Agent;
+  private _plugins: Plugin[] = [];
+  private _runtime: PluginRuntime;
+  private _pluginRunner: PluginRunner | null = null;
+  private _cwd: string;
+  private _listeners = new Set<(event: AgentEvent) => void>();
+  private _unsubscribe: (() => void) | null = null;
 
-// ============================================================================
-// 路径
-// ============================================================================
+  constructor(options: AgentSessionOptions = {}) {
+    this._cwd = options.cwd ?? process.cwd();
+    this.agent = new Agent({
+      systemPrompt: options.systemPrompt,
+      model: options.model,
+      tools: options.tools,
+    });
 
-function getSessionsDir(): string {
-  return path.join(os.homedir(), ".tca", "sessions");
-}
+    // Create default runtime (will be overridden by bindPlugins)
+    this._runtime = this.createDefaultRuntime();
 
-function cwdHash(cwd: string): string {
-  return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-}
+    // Wire agent events to session listeners + plugin runner
+    this._unsubscribe = this.agent.subscribe((event, _signal) => {
+      this.dispatch(event);
+      this._pluginRunner?.emit(event).catch(() => {});
+    });
+  }
 
-function sessionDir(cwd: string): string {
-  return path.join(getSessionsDir(), cwdHash(cwd));
-}
+  get messages(): AgentMessage[] {
+    return this.agent.state.messages;
+  }
 
-function sessionFilePath(cwd: string, sessionId: string): string {
-  return path.join(sessionDir(cwd), `${sessionId}.jsonl`);
-}
+  get isStreaming(): boolean {
+    return this.agent.state.isStreaming;
+  }
 
-function metaFilePath(cwd: string, sessionId: string): string {
-  return path.join(sessionDir(cwd), `${sessionId}.meta.json`);
-}
+  async prompt(text: string): Promise<void> {
+    await this.agent.agentLoop(text);
+  }
 
-// ============================================================================
-// 生成 session ID
-// ============================================================================
+  abort(): void {
+    this.agent.abort();
+  }
 
-function generateSessionId(): string {
-  const ts = Date.now().toString(36);
-  const uid = randomUUID().slice(0, 8);
-  return `s-${ts}-${uid}`;
-}
+  subscribe(listener: (event: AgentEvent) => void): () => void {
+    this._listeners.add(listener);
+    return () => this._listeners.delete(listener);
+  }
 
-// ============================================================================
-// 核心 API
-// ============================================================================
+  /** Bind plugins to the session — distributes them to the PluginRunner */
+  bindPlugins(plugins: Plugin[]): void {
+    this._plugins = plugins.slice();
+    this._pluginRunner = createPluginRunner(
+      { plugins: this._plugins, errors: [] },
+      this._runtime,
+      {
+        cwd: this._cwd,
+        model: this.agent.state.model,
+        systemPrompt: this.agent.state.systemPrompt,
+      },
+    );
+    // 绑定 core actions 到 agent
+    const agent = this.agent;
+    this._pluginRunner.bindCore({
+      isIdle: () => !agent.state.isStreaming,
+      abort: () => agent.abort(),
+      waitForIdle: () => agent.waitForIdle(),
+      sendMessage: async (c) => {
+        await agent.waitForIdle();
+        agent.agentLoop(c).catch(() => {});
+      },
+      getActiveTools: () => agent.state.tools.map((t) => t.name),
+      getAllTools: () => agent.state.tools.map((t) => t.name),
+      setActiveTools: (names) => {
+        agent.tools = agent.state.tools.filter((t) => names.includes(t.name));
+      },
+      notify: (m, t) => {
+        console.log(`[${t ?? "info"}] ${m}`);
+      },
+    });
+  }
 
-/**
- * 列出指定工作目录下的所有 session，按更新时间降序排列。
- */
-export async function listSessions(cwd: string): Promise<SessionInfo[]> {
-  const dir = sessionDir(cwd);
-  try {
-    const files = await readdir(dir);
-    const metaFiles = files.filter((f) => f.endsWith(".meta.json"));
-    const sessions: SessionInfo[] = [];
+  /** Get the plugin runtime for wiring */
+  getRuntime(): PluginRuntime {
+    return this._runtime;
+  }
 
-    for (const metaFile of metaFiles) {
-      const sessionId = metaFile.replace(".meta.json", "");
-      try {
-        const content = await readFile(path.join(dir, metaFile), "utf8");
-        const meta: SessionMeta = JSON.parse(content);
-        sessions.push({
-          meta,
-          filePath: sessionFilePath(cwd, sessionId),
-        });
-      } catch {
-        // skip corrupted meta files
+  /** Get registered commands from all plugins */
+  getCommands(): PluginCommand[] {
+    const byName = new Map<string, PluginCommand>();
+    for (const p of this._plugins) {
+      for (const cmd of p.commands.values()) {
+        if (!byName.has(cmd.name)) byName.set(cmd.name, cmd);
       }
     }
-
-    sessions.sort((a, b) => new Date(b.meta.updatedAt).getTime() - new Date(a.meta.updatedAt).getTime());
-    return sessions;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * 获取最新的 session，如果没有则创建新 session。
- */
-export async function getOrCreateLatestSession(
-  cwd: string,
-  modelId: string,
-): Promise<{ sessionId: string; messages: AgentMessage[]; isNew: boolean }> {
-  const sessions = await listSessions(cwd);
-
-  if (sessions.length > 0) {
-    const latest = sessions[0]!;
-    try {
-      const messages = await loadSessionMessages(latest.filePath);
-      return { sessionId: latest.meta.id, messages, isNew: false };
-    } catch {
-      // 加载失败，创建新 session
-    }
+    return Array.from(byName.values());
   }
 
-  return createSession(cwd, modelId);
-}
-
-/**
- * 创建新 session。
- */
-export async function createSession(
-  cwd: string,
-  modelId: string,
-): Promise<{ sessionId: string; messages: AgentMessage[]; isNew: boolean }> {
-  const sessionId = generateSessionId();
-  const now = new Date().toISOString();
-  const meta: SessionMeta = {
-    id: sessionId,
-    cwd,
-    modelId,
-    createdAt: now,
-    updatedAt: now,
-    messageCount: 0,
-  };
-
-  const dir = sessionDir(cwd);
-  await mkdir(dir, { recursive: true });
-  await writeFile(metaFilePath(cwd, sessionId), JSON.stringify(meta, null, 2), "utf8");
-  // 创建空的 JSONL
-  await writeFile(sessionFilePath(cwd, sessionId), "", "utf8");
-
-  return { sessionId, messages: [], isNew: true };
-}
-
-/**
- * 加载 session 的消息。
- */
-export async function loadSessionMessages(filePath: string): Promise<AgentMessage[]> {
-  try {
-    const content = await readFile(filePath, "utf8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    const messages: AgentMessage[] = [];
-    for (const line of lines) {
-      try {
-        messages.push(JSON.parse(line) as AgentMessage);
-      } catch {
-        // 跳过损坏的行
-        continue;
+  /** Get registered tools from all plugins */
+  getPluginTools(): AgentTool[] {
+    const byName = new Map<string, AgentTool>();
+    for (const p of this._plugins) {
+      for (const t of p.tools.values()) {
+        if (!byName.has(t.name)) byName.set(t.name, t);
       }
     }
-    return messages;
-  } catch {
-    return [];
+    return Array.from(byName.values());
+  }
+
+  dispose(): void {
+    this._unsubscribe?.();
+    this._listeners.clear();
+    this._plugins = [];
+    this._pluginRunner = null;
+  }
+
+  // ============================================================================
+  // Private
+  // ============================================================================
+
+  private dispatch(event: AgentEvent): void {
+    for (const listener of this._listeners) {
+      try { listener(event); } catch { /* ignore */ }
+    }
+  }
+
+  private createDefaultRuntime(): PluginRuntime {
+    const ni = () => { throw new Error("Runtime not initialized"); };
+    return {
+      sendMessage: (text: string) => { this.prompt(text).catch(() => {}); },
+      getActiveTools: ni,
+      getAllTools: ni,
+      setActiveTools: ni,
+      notify: () => {},
+    };
   }
 }
 
-/**
- * 追加消息到 session。
- *
- * 写顺序：先追加 jsonl，再更新 meta。
- * meta 写入单独 try-catch，不影响 jsonl 写入。
- */
-export async function appendSessionMessage(
-  cwd: string,
-  sessionId: string,
-  message: AgentMessage,
-): Promise<void> {
-  const dir = sessionDir(cwd);
-  await mkdir(dir, { recursive: true });
-
-  // 先追加到 JSONL（主要数据）
-  const filePath = sessionFilePath(cwd, sessionId);
-  await appendFile(filePath, JSON.stringify(message) + "\n", "utf8");
-
-  // 再更新 meta（辅助数据），失败不阻断主流程
-  try {
-    const metaPath = metaFilePath(cwd, sessionId);
-    const content = await readFile(metaPath, "utf8");
-    const meta: SessionMeta = JSON.parse(content);
-    meta.messageCount += 1;
-    meta.updatedAt = new Date().toISOString();
-    await writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
-  } catch {
-    // meta 写入失败不影响消息持久化
-  }
-}
-
-/**
- * 更新 session 名称。
- */
-export async function renameSession(cwd: string, sessionId: string, name: string): Promise<void> {
-  const metaPath = metaFilePath(cwd, sessionId);
-  try {
-    const content = await readFile(metaPath, "utf8");
-    const meta: SessionMeta = JSON.parse(content);
-    meta.name = name;
-    meta.updatedAt = new Date().toISOString();
-    await writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
-  } catch {
-    // meta 不存在则忽略
-  }
-}
-
-/**
- * 删除 session。
- */
-export async function deleteSession(cwd: string, sessionId: string): Promise<void> {
-  const dir = sessionDir(cwd);
-  try {
-    await unlink(path.join(dir, `${sessionId}.jsonl`));
-    await unlink(path.join(dir, `${sessionId}.meta.json`));
-  } catch {
-    // 文件不存在则忽略
-  }
+/** Factory function — pi-mono createAgentSession equivalent */
+export function createAgentSession(options: AgentSessionOptions = {}): AgentSession {
+  return new AgentSession(options);
 }

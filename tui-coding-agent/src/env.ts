@@ -1,7 +1,7 @@
 /**
  * 环境变量加载
  *
- * 参考 openwiki 的 src/env.ts 设计：
+ * 参考 openwiki/tui-coding-agent 的 env.ts 设计：
  * - 从项目目录下的 .env 文件加载环境变量
  * - 如果 process.env 中已经设置了值，则不覆盖
  * - 纯 Node.js 实现，不依赖第三方库
@@ -19,10 +19,10 @@ type EnvMap = Record<string, string>;
  * 2. 用户目录下的 .tca/.env
  */
 function findEnvPaths(cwd: string): string[] {
-  const paths: string[] = [];
-  paths.push(path.join(cwd, ".env"));
-  paths.push(path.join(os.homedir(), ".tca", ".env"));
-  return paths;
+  return [
+    path.join(cwd, ".env"),
+    path.join(os.homedir(), ".tca", ".env"),
+  ];
 }
 
 /**
@@ -64,11 +64,12 @@ export function parseEnv(content: string): EnvMap {
 
 function parseEnvValue(value: string): string {
   // 移除引号
-  if ((value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))) {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
     return value.slice(1, -1);
   }
-
   return value;
 }
 
