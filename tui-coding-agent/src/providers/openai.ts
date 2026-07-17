@@ -131,10 +131,10 @@ export async function* streamOpenAI(
         signal: combinedSignal,
       });
 
-      clearTimeout(timeoutTimer);
-      combo.destroy();
-
       if (!response.ok || !response.body) {
+        // 非成功响应：可安全清理定时器和信号监听
+        clearTimeout(timeoutTimer);
+        combo.destroy();
         const text = await response.text().catch(() => "");
         lastError = `API error ${response.status}: ${text}`;
         if (response.status < 500 && response.status !== 429) {
@@ -232,8 +232,12 @@ export async function* streamOpenAI(
         usage: { input: totalInput, output: totalOutput, totalTokens: totalInput + totalOutput },
         finishReason: lastFinishReason,
       };
+      // 流式读取完成，清理定时器和信号监听
+      clearTimeout(timeoutTimer);
+      combo.destroy();
       return;
     } catch (error) {
+      // 异常路径：清理定时器和信号监听
       clearTimeout(timeoutTimer);
       combo.destroy();
       const msg = error instanceof Error ? error.message : String(error);

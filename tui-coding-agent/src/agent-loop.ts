@@ -63,6 +63,12 @@ export async function runAgentLoop(
   }
 
   await runLoop(currentContext, newMessages, config, signal, emit);
+
+  // 同步 currentContext.messages 的最终状态（可能被压缩）回 context.messages
+  // 这样调用方（agent.ts）能感知到 loop 内的压缩结果
+  context.messages.length = 0;
+  context.messages.push(...currentContext.messages);
+
   return newMessages;
 }
 
@@ -125,6 +131,9 @@ async function runLoop(
       }
 
       const message = await streamAssistantResponse(currentContext, config, signal, emit);
+      // AI 回复必须加入 currentContext.messages，否则 turn_end/agent_end 时
+      // agent.state.messages 不含 AI 回复，TUI 会丢失 AI 输出
+      currentContext.messages.push(message);
       newMessages.push(message);
 
       if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -192,7 +201,7 @@ async function streamAssistantResponse(
   if (shouldCompact(usage, reserveTokens)) {
     const cutPoint = findCutPoint(context.messages, config.keepRecentTokens ?? DEFAULT_COMPACTION_CONFIG.keepRecentTokens);
     if (cutPoint) {
-      const compacted = buildCompactedMessages(context.messages, cutPoint, "[Auto-compaction triggered]", context.systemPrompt);
+      const compacted = buildCompactedMessages(context.messages, cutPoint, "[Auto-compaction triggered]");
       context.messages.length = 0;
       context.messages.push(...compacted);
       await emit({ type: "notification", message: `Auto-compacted: kept ${compacted.length} messages (${cutPoint.truncatedCount} compressed)`, level: "info" });
@@ -257,7 +266,17 @@ async function streamAssistantResponse(
     switch (event.type) {
       case "text_delta":
         textBuffer += event.delta;
-        partialMessage.content = [{ type: "text", text: textBuffer }];
+        // 更新 partialMessage.content：保留已有 blocks（如 toolCall），替换/追加 text block
+        // 每次创建新对象，避免 mutate 被外部缓存的 block 引用
+        {
+          const lastBlock = contentBlocks[contentBlocks.length - 1];
+          if (lastBlock && lastBlock.type === "text") {
+            contentBlocks[contentBlocks.length - 1] = { type: "text", text: textBuffer };
+          } else {
+            contentBlocks.push({ type: "text", text: textBuffer });
+          }
+          partialMessage.content = [...contentBlocks];
+        }
         await emit({
           type: "message_update",
           message: { ...partialMessage },
@@ -276,8 +295,14 @@ async function streamAssistantResponse(
 
       case "tool_call":
         if (event.toolCall) {
+          // 若有未提交的 textBuffer，先固化为 text block
           if (textBuffer) {
-            contentBlocks.push({ type: "text", text: textBuffer });
+            const lastBlock = contentBlocks[contentBlocks.length - 1];
+            if (lastBlock && lastBlock.type === "text") {
+              contentBlocks[contentBlocks.length - 1] = { type: "text", text: textBuffer };
+            } else {
+              contentBlocks.push({ type: "text", text: textBuffer });
+            }
             textBuffer = "";
           }
           contentBlocks.push({
@@ -311,7 +336,11 @@ async function streamAssistantResponse(
   }
 
   if (textBuffer) {
-    contentBlocks.push({ type: "text", text: textBuffer });
+    // 若最后一个 block 已是 text（text_delta 时已同步），不重复 push
+    const lastBlock = contentBlocks[contentBlocks.length - 1];
+    if (!lastBlock || lastBlock.type !== "text") {
+      contentBlocks.push({ type: "text", text: textBuffer });
+    }
   }
 
   if (contentBlocks.some((c) => c.type === "toolCall") && stopReason !== "error") {

@@ -101,7 +101,10 @@ export function createBashTool(): AgentTool<typeof BashParams> {
           maxBuffer: 10 * 1024 * 1024,
           timeout,
         }, (error, stdout, stderr) => {
-          const exitCode = error?.code ?? 0;
+          // error.code 可能是数字（退出码）或字符串（如 "ETIMEDOUT"），统一转为数字
+          const exitCode = error
+            ? (typeof error.code === "number" ? error.code : 1)
+            : 0;
           const output = [
             stdout ? `stdout:\n${stdout.slice(0, MAX_OUTPUT)}` : "",
             stderr ? `stderr:\n${stderr.slice(0, MAX_OUTPUT)}` : "",
@@ -214,23 +217,31 @@ export function createGrepTool(): AgentTool<typeof GrepParams> {
       const pattern = new RegExp(params.pattern, "i");
       const results: string[] = [];
       let fileCount = 0;
+      const MAX_RESULTS = 1000;
+      const MAX_FILE_SIZE = 1024 * 1024; // 1MB，跳过更大文件
+
+      // 用内部异常中断整个递归，避免达到上限后继续无效遍历
+      class SearchLimitReached extends Error {}
 
       async function searchDir(dir: string, depth: number): Promise<void> {
-        if (depth > 10 || results.length > 1000) return;
+        if (depth > 10) return;
         const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
         for (const entry of entries) {
-          if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist") continue;
+          if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === ".git") continue;
           const fullPath = path.join(dir, entry.name);
           if (entry.isDirectory()) {
             await searchDir(fullPath, depth + 1);
           } else if (entry.isFile()) {
             if (params.glob && !matchGlob(entry.name, params.glob)) continue;
+            // 跳过大文件
+            const fileStat = await stat(fullPath).catch(() => null);
+            if (fileStat && fileStat.size > MAX_FILE_SIZE) continue;
             const content = await readFile(fullPath, "utf8").catch(() => "");
             const lines = content.split("\n");
             for (let i = 0; i < lines.length; i++) {
-              if (pattern.test(lines[i])) {
-                results.push(`${path.relative(searchPath, fullPath)}:${i + 1}: ${lines[i].trim()}`);
-                if (results.length >= 100) break;
+              if (pattern.test(lines[i]!)) {
+                results.push(`${path.relative(searchPath, fullPath)}:${i + 1}: ${lines[i]!.trim()}`);
+                if (results.length >= MAX_RESULTS) throw new SearchLimitReached();
               }
             }
             fileCount++;
@@ -238,7 +249,12 @@ export function createGrepTool(): AgentTool<typeof GrepParams> {
         }
       }
 
-      await searchDir(searchPath, 0);
+      try {
+        await searchDir(searchPath, 0);
+      } catch (err) {
+        // 达到上限是预期行为，静默处理
+        if (!(err instanceof SearchLimitReached)) throw err;
+      }
       const output = results.length > 0 ? results.join("\n") : "No matches found";
       return {
         content: [{ type: "text", text: output.slice(0, MAX_OUTPUT) }],

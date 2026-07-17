@@ -353,7 +353,6 @@ export async function appendCompactionEntry(
  */
 export function buildTree(entries: SessionEntry[]): TreeNode[] {
   const roots: TreeNode[] = [];
-  const byId = new Map<string, TreeNode>();
   const childMap = new Map<string | null, SessionEntry[]>();
 
   for (const entry of entries) {
@@ -368,9 +367,6 @@ export function buildTree(entries: SessionEntry[]): TreeNode[] {
     const entryWithMeta = entry as SessionEntry;
     const id = "id" in entryWithMeta ? entryWithMeta.id : null;
     const node: TreeNode = { entry, children: [], depth };
-    if (id && byId.has(id)) {
-      // already built
-    }
     const children = childMap.get(id ?? null) ?? [];
     for (const child of children) {
       node.children.push(buildSubTree(child, depth + 1));

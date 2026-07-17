@@ -212,14 +212,15 @@ export function createCompactionEntry(
 
 /**
  * 构建压缩后的消息列表供 LLM 使用。
- * 返回一个只读视图：system + [compaction summary] + keptMessages。
+ * 返回一个只读视图：[compaction summary] + keptMessages。
  * 不会修改原始 messages 数组。
+ *
+ * 注：systemPrompt 由 Agent 单独管理，不在此处注入。
  */
 export function buildCompactedMessages(
   messages: AgentMessage[],
   cutPoint: CutPoint,
   summary: string,
-  systemPrompt: string,
 ): AgentMessage[] {
   const keptMessages = messages.slice(cutPoint.firstKeptIndex);
   const summaryMsg: AssistantMessage = {

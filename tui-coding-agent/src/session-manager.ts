@@ -352,12 +352,19 @@ export class SessionManager {
   /**
    * 获取 firstKeptEntryId 对应的 entry ID（用于 compaction）。
    * 在当前 entries 中找到第 index 条消息 entry 的 id。
+   *
+   * @param index 消息索引（基于 agent._messages，可能含 summaryMsg 偏移）
+   * @param summaryOffset summaryMsg 在 agent._messages 中的偏移量（0 表示无 summaryMsg，1 表示第一条是 summaryMsg）
    */
-  getEntryIdByMessageIndex(index: number): string | null {
+  getEntryIdByMessageIndex(index: number, summaryOffset = 0): string | null {
+    // agent._messages 中 summaryMsg 无对应 entry，需扣除偏移
+    const entryIdx = index - summaryOffset;
+    if (entryIdx < 0) return null;
+
     let msgIdx = 0;
     for (const e of this._entries) {
       if ((e as CompactionEntry).type !== "compaction") {
-        if (msgIdx === index) {
+        if (msgIdx === entryIdx) {
           return (e as SessionEntry & { id: string }).id ?? null;
         }
         msgIdx++;

@@ -142,7 +142,7 @@ export class AgentSession implements IAgentSession {
   }
 
   private createDefaultRuntime(): PluginRuntime {
-    const ni = () => { throw new Error("Runtime not initialized"); };
+    const ni = () => { throw new Error("Runtime not initialized. Call bindPlugins() first."); };
     return {
       sendMessage: (text: string) => { this.prompt(text).catch(() => {}); },
       getActiveTools: ni,

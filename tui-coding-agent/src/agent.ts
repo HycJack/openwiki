@@ -84,6 +84,9 @@ export class Agent {
   set model(value: ModelConfig) { this._model = value; }
   set tools(value: AgentTool[]) { this._tools = value.slice(); }
 
+  /** 当前 AbortController 的 signal（用于外部 LLM 调用联动中断） */
+  get signal(): AbortSignal { return this._abortController.signal; }
+
   subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -205,9 +208,10 @@ export class Agent {
         this._abortController.signal,
       );
 
-      // allMessages = [userMsg, assistantMsg, toolResult...] (不含历史)
-      // 合并历史 + 新消息
-      this._messages = [...context.messages, ...allMessages];
+      // runAgentLoop 已将最终消息（含可能的 loop 内压缩）同步到 context.messages
+      // context.messages 现包含 [原历史(可能被压缩), ...prompts, assistant, toolResults]
+      // allMessages 是本轮新增子集（prompts + assistant + toolResults），已含在 context.messages 中
+      this._messages = [...context.messages];
 
       // Agent end
       await this.broadcast({ type: "agent_end", messages: this._messages });
@@ -263,19 +267,14 @@ export class Agent {
 
       const messages = await runAgentLoop(
         [userMsg],
-        {
-          model: this._model,
-          systemPrompt: this._systemPrompt,
-          tools: this._tools,
-          messages: this._messages,
-        },
+        context,
         loopConfig,
         () => {}, // no events in print mode
         this._abortController.signal,
       );
 
-      // 保存上下文历史 — 直接在 this._messages 上追加
-      this._messages.push(...messages);
+      // runAgentLoop 已将最终消息同步到 context.messages（即 this._messages）
+      // messages 是本轮新增子集，已含在 this._messages 中，无需再 push
 
       // Find the last assistant message
       const lastAssistant = messages
@@ -337,7 +336,6 @@ export class Agent {
         this._messages,
         cutPoint,
         summary,
-        this._systemPrompt,
       );
 
       // 持久化 CompactionEntry（通过回调注入 session-manager）
@@ -376,14 +374,14 @@ export class Agent {
           llmMessages,
           "",  // 不需要 system prompt
           [],  // 不需要工具
-          { signal: new AbortController().signal },
+          { signal: this._abortController.signal },
         )
       : streamOpenAI(
           this._model,
           llmMessages,
           "",
           [],
-          { signal: new AbortController().signal },
+          { signal: this._abortController.signal },
         );
 
     let textBuffer = "";

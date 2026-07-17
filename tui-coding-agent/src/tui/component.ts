@@ -38,6 +38,7 @@ import {
   ProcessTerminal,
   matchesKey,
   visibleWidth,
+  truncateToWidth,
   type Component,
   type MarkdownTheme,
 } from "@earendil-works/pi-tui";
@@ -94,12 +95,31 @@ const C = {
 } as const;
 
 // ============================================================================
-// TitleBar — 参考 pi-coding-agent 的顶部栏
+// TitleBar — 顶部边框装饰
 // ============================================================================
 
 export type StatusType = "idle" | "streaming" | "error";
 
 export class TitleBar implements Component {
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    // 顶部边框：╭──────...──╮
+    const prefix = `${C.dim}╭${C.reset}`;
+    const suffix = `${C.dim}╮${C.reset}`;
+    const prefixLen = visibleWidth(prefix);
+    const suffixLen = visibleWidth(suffix);
+    const sepWidth = Math.max(0, width - prefixLen - suffixLen);
+    const sep = `${C.dim}${"─".repeat(sepWidth)}${C.reset}`;
+    return [truncateToWidth(`${prefix}${sep}${suffix}`, width)];
+  }
+}
+
+// ============================================================================
+// StatusBar — 输入框下方的状态栏（状态点 + 状态文本 + 模型名）
+// ============================================================================
+
+export class StatusBar implements Component {
   statusText = "Ready";
   statusType: StatusType = "idle";
   modelLabel = "";
@@ -118,23 +138,16 @@ export class TitleBar implements Component {
       `${C.green}●${C.reset}`;
 
     const left = `${dot} ${this.statusText}`;
+    const right = this.modelLabel ? `${C.dim}${this.modelLabel}${C.reset}` : "";
 
-    const rightParts: string[] = [];
-    if (this.modelLabel) rightParts.push(`${C.dim}${this.modelLabel}${C.reset}`);
-    const right = rightParts.join("  ");
-
-    // 用 ╭─ ╮ 装饰顶部
-    const prefix = `${C.dim}╭─${C.reset} `;
-    const prefixLen = visibleWidth(prefix);
     const leftLen = visibleWidth(left);
     const rightLen = visibleWidth(right);
+    const gap = rightLen > 0 ? 2 : 0;
+    const contentWidth = leftLen + gap + rightLen;
+    const padding = width > contentWidth ? " ".repeat(width - contentWidth) : "";
 
-    const innerWidth = width - prefixLen;
-    const contentWidth = leftLen + (rightLen > 0 ? 2 + rightLen : 0);
-    const padding = innerWidth > contentWidth ? " ".repeat(innerWidth - contentWidth) : "";
-
-    const line = `${prefix}${left}${padding}${right ? "  " + right : ""}`;
-    return [line];
+    const line = `${left}${padding}${right ? "  " + right : ""}`;
+    return [truncateToWidth(line, width)];
   }
 }
 
@@ -150,20 +163,23 @@ export class Footer implements Component {
 
   render(width: number): string[] {
     if (this.commandHint) {
-      const hint = this.commandHint + " ".repeat(Math.max(0, width - visibleWidth(this.commandHint)));
+      const hintWidth = visibleWidth(this.commandHint);
+      const hint = hintWidth >= width
+        ? truncateToWidth(this.commandHint, width)
+        : this.commandHint + " ".repeat(width - hintWidth);
       return [hint];
     }
     if (!this.text) {
       const base = `${C.dim}╰─ ❯ ${C.reset}`;
       const baseLen = visibleWidth(base);
       const sep = `${C.dim}─${C.reset}`.repeat(Math.max(0, width - baseLen));
-      return [base + sep];
+      return [truncateToWidth(base + sep, width)];
     }
     const line = `${C.dim}╰─ ❯ ${this.text}${C.reset}`;
     const lineLen = visibleWidth(line);
-    if (lineLen > width) return [line.slice(0, width - 3) + "..."];
+    if (lineLen > width) return [truncateToWidth(line, width)];
     const sep = `${C.dim}─${C.reset}`.repeat(Math.max(0, width - lineLen));
-    return [line + sep];
+    return [truncateToWidth(line + sep, width)];
   }
 }
 
@@ -243,13 +259,14 @@ export class MessageList implements Component {
     // 行数限制 — 从末尾保留 maxLines 行
     if (lines.length > this.maxLines) {
       const folded = lines.length - this.maxLines;
-      return [
-        `${C.dim}... (${folded} lines folded)${C.reset}`,
-        ...lines.slice(lines.length - this.maxLines + 1),
-      ];
+      const foldedLine = `${C.dim}... (${folded} lines folded)${C.reset}`;
+      const kept = lines.slice(lines.length - this.maxLines + 1);
+      // 截断所有行到终端宽度，防止 Markdown 代码块等长行超宽
+      return [truncateToWidth(foldedLine, width), ...kept.map((l) => truncateToWidth(l, width))];
     }
 
-    return lines;
+    // 截断所有行到终端宽度，防止 Markdown 代码块等长行超宽
+    return lines.map((l) => truncateToWidth(l, width));
   }
 
   private renderOne(msg: AgentMessage, width: number, out: string[]): void {
@@ -337,8 +354,9 @@ export class MessageList implements Component {
       if (!textBlock) continue;
 
       const firstLine = textBlock.text.split("\n")[0] ?? "";
-      const preview = firstLine.length > this.toolResultPreviewLength
-        ? firstLine.slice(0, this.toolResultPreviewLength) + "..."
+      // 按可见宽度截断 preview，预留前缀 "┊  ✓ " 的空间
+      const preview = visibleWidth(firstLine) > this.toolResultPreviewLength
+        ? truncateToWidth(firstLine, this.toolResultPreviewLength)
         : firstLine;
 
       out.push(`${C.green}┊${C.reset}  ${C.green}${C.bold}✓${C.reset} ${C.dim}${preview}${C.reset}`);
@@ -393,9 +411,11 @@ export interface ChatTUI {
   titleBar: TitleBar;
   footer: Footer;
   inputBar: InputBar;
+  statusBar: StatusBar;
   updateMessages: (messages: AgentMessage[]) => void;
   appendStreamingDelta: (delta: string) => void;
   setStatus: (text: string, type?: StatusType) => void;
+  setModelLabel: (label: string) => void;
   stop: () => void;
 }
 
@@ -409,10 +429,11 @@ export interface CreateChatTUIOptions {
  * createChatTUI — 按 pi-coding-agent 风格创建 TUI
  *
  * 布局（从上到下）：
- *   TitleBar      — ● Ready [gpt-4o]
+ *   TitleBar      — 顶部边框 ╭──╮
  *   MessageList   — 角色竖线消息流
  *   Footer        — ❯ 当前工作目录
  *   Input         — 底部输入行
+ *   StatusBar     — ● Ready [gpt-4o]
  */
 export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
   const terminal = new ProcessTerminal();
@@ -422,6 +443,7 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
   const titleBar = new TitleBar();
   const footer = new Footer();
   const inputBar = new InputBar();
+  const statusBar = new StatusBar();
 
   // 输入历史（方向键导航）
   const inputHistory: string[] = [];
@@ -469,17 +491,18 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
   }
 
   if (opts.modelLabel) {
-    titleBar.modelLabel = opts.modelLabel;
+    statusBar.modelLabel = opts.modelLabel;
   }
   if (opts.cwd) {
     footer.text = opts.cwd;
   }
 
-  // Layout: TitleBar → MessageList → Footer → Input
+  // Layout: TitleBar → MessageList → Footer → Input → StatusBar
   tui.addChild(titleBar);
   tui.addChild(messageList);
   tui.addChild(footer);
   tui.addChild(inputBar.input);
+  tui.addChild(statusBar);
 
   // Ctrl+C + 指令提示
   tui.addInputListener((data: string) => {
@@ -495,7 +518,7 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
     // Ctrl+O 切换折叠/展开所有 AI 消息
     if (matchesKey(data, "ctrl+o")) {
       messageList.expandAll = !messageList.expandAll;
-      titleBar.modelLabel = messageList.expandAll
+      statusBar.modelLabel = messageList.expandAll
         ? `${opts.modelLabel ?? ""} ${C.green}[Exp]${C.reset}`
         : opts.modelLabel ?? "";
       tui.requestRender();
@@ -548,6 +571,7 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
     titleBar,
     footer,
     inputBar,
+    statusBar,
     updateMessages(messages: AgentMessage[]) {
       messageList.messages = messages;
       messageList.streamingMessage = null;
@@ -561,7 +585,11 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
       tui.requestRender();
     },
     setStatus(text: string, type: StatusType = "idle") {
-      titleBar.setStatus(text, type);
+      statusBar.setStatus(text, type);
+      tui.requestRender();
+    },
+    setModelLabel(label: string) {
+      statusBar.modelLabel = label;
       tui.requestRender();
     },
     stop() {

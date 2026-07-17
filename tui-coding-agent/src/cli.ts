@@ -41,6 +41,18 @@ import type { AgentTool, ModelConfig, TextContent, AgentMessage, AgentEvent } fr
 // 参数解析
 // ============================================================================
 
+/** 检测消息是否为 compaction summary（由 buildCompactedMessages 生成） */
+function isCompactionSummary(msg: AgentMessage): boolean {
+  if (msg.role !== "assistant") return false;
+  const firstBlock = msg.content[0];
+  return firstBlock?.type === "text" && firstBlock.text.startsWith("[Context Compaction Summary]");
+}
+
+/** 计算 agent._messages 中 summaryMsg 的偏移量（0 或 1） */
+function summaryOffsetOf(messages: AgentMessage[]): number {
+  return messages.length > 0 && isCompactionSummary(messages[0]!) ? 1 : 0;
+}
+
 interface CliArgs {
   model?: string;
   provider?: string;
@@ -174,9 +186,11 @@ async function main(): Promise<void> {
 
   // 注入 compaction 持久化回调（参考 pi-mono 的 appendCompaction）
   // autoCompactIfNeeded 完成后，将 CompactionEntry 追加到 session JSONL
-  agent.setCompactionCallback(async (summary, cutPoint, _keptMessages) => {
-    // 找到 firstKeptEntryId：cutPoint.firstKeptIndex 是消息索引，需要映射到 entry id
-    const firstKeptEntryId = sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex);
+  agent.setCompactionCallback(async (summary, cutPoint, keptMessages) => {
+    // 找到 firstKeptEntryId：cutPoint.firstKeptIndex 是 agent._messages 索引，需要映射到 entry id
+    // 若 agent._messages 以 summaryMsg 开头（二次压缩），需扣除偏移
+    const summaryOffset = summaryOffsetOf(keptMessages);
+    const firstKeptEntryId = sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex, summaryOffset);
     if (!firstKeptEntryId) {
       throw new Error("Cannot find firstKeptEntryId for compaction");
     }
@@ -439,7 +453,7 @@ async function handleModelCommand(args: string[], ctx: CommandCtx): Promise<void
     baseURL: savedModel?.baseURL ?? ctx.model.baseURL,
   };
 
-  ctx.chat.titleBar.modelLabel = modelId;
+  ctx.chat.setModelLabel(modelId);
   ctx.chat.setStatus(`Switched to ${provider}:${modelId}`, "idle");
 }
 
@@ -536,7 +550,7 @@ async function performCompact(ctx: CommandCtx, _instructions: string): Promise<v
       llmMessages,
       "",
       [],
-      { signal: new AbortController().signal },
+      { signal: ctx.agent.signal },
     );
 
     let summaryText = "[Compacted by LLM]\n";
@@ -555,12 +569,13 @@ async function performCompact(ctx: CommandCtx, _instructions: string): Promise<v
     }
     process.stdout.write(`\n`);
 
-    const compacted = buildCompactedMessages(messages, cutPoint, summaryText, ctx.agent.state.systemPrompt);
+    const compacted = buildCompactedMessages(messages, cutPoint, summaryText);
     ctx.agent.setMessages(compacted);
     ctx.chat.updateMessages(compacted);
 
     // 持久化 CompactionEntry 到 session JSONL（参考 pi-mono 的 appendCompaction）
-    const firstKeptEntryId = ctx.sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex);
+    const summaryOffset = summaryOffsetOf(messages);
+    const firstKeptEntryId = ctx.sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex, summaryOffset);
     if (firstKeptEntryId) {
       const entry = createCompactionEntry(summaryText, cutPoint, firstKeptEntryId);
       await ctx.sessionMgr.appendCompaction(entry);
