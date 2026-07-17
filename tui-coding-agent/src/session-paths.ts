@@ -20,3 +20,7 @@ export function sessionDir(cwd: string): string {
 export function sessionFilePath(cwd: string, sessionId: string): string {
   return path.join(sessionDir(cwd), `${sessionId}.jsonl`);
 }
+
+export function metaFilePath(cwd: string, sessionId: string): string {
+  return path.join(sessionDir(cwd), `${sessionId}.meta.json`);
+}

@@ -3,9 +3,7 @@
  *
  * 布局：
  * ```
- * ┌──────────────────────────────────────────────────────┐
- * │  ● Ready                      gpt-4o  Ctrl+C         │  ← TitleBar
- * ├──────────────────────────────────────────────────────┤
+ * ╭──────────────────────────────────────────────────────╮  ← TitleBar（边框）
  * │                                                      │
  * │  ┊  User  ──────────────── 12:00:00                  │  ← User msg
  * │  ┊  帮我写一个 react hook                             │
@@ -19,9 +17,9 @@
  * │                                                      │
  * │  ✓ total 12                                         │  ← tool result
  * │                                                      │
- * ├──────────────────────────────────────────────────────┤
- * │  ❯ /workspace/project                                │  ← Footer
- * └──────────────────────────────────────────────────────┘
+ * ╰─ ❯ /workspace/project ─────────────────────────────  ← Footer（工作目录）
+ * > input cursor                                          ← Input
+ * ● Ready  gpt-4o                                         ← StatusBar（状态+模型）
  * ```
  *
  * 角色左侧竖线配色：
@@ -525,12 +523,12 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
       return undefined;
     }
 
-    // Ctrl+P / Ctrl+N 输入历史导航
-    if (matchesKey(data, "ctrl+p")) {
+    // ↑/↓ 输入历史导航
+    if (matchesKey(data, "up")) {
       historyPrev();
       return undefined;
     }
-    if (matchesKey(data, "ctrl+n")) {
+    if (matchesKey(data, "down")) {
       historyNext();
       return undefined;
     }

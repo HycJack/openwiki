@@ -7,6 +7,10 @@
 
 import type { EventBus as IEventBus, EventBusHandler } from "./types.js";
 
+function isPromise(value: unknown): value is Promise<unknown> {
+  return typeof value === "object" && value !== null && "then" in value && typeof (value as Promise<unknown>).then === "function";
+}
+
 export function createEventBus(): IEventBus {
   const handlers = new Map<string, Set<EventBusHandler>>();
 
@@ -36,11 +40,13 @@ export function createEventBus(): IEventBus {
       for (const handler of set) {
         try {
           const result = handler(data);
-          if (result && typeof result === "object" && "catch" in result) {
-            (result as Promise<void>).catch(() => {});
+          if (isPromise(result)) {
+            result.catch((err) => {
+              console.error(`[EventBus] handler error for event "${event}":`, err instanceof Error ? err.message : String(err));
+            });
           }
-        } catch {
-          // ignore handler errors
+        } catch (err) {
+          console.error(`[EventBus] handler error for event "${event}":`, err instanceof Error ? err.message : String(err));
         }
       }
     },

@@ -236,3 +236,17 @@ export function buildCompactedMessages(
 
   return [summaryMsg, ...keptMessages];
 }
+
+/**
+ * 判断消息是否为 compaction summary（消息以 [Context Compaction Summary] 开头）
+ */
+export function isCompactionSummary(msg: AgentMessage): boolean {
+  if (msg.role !== "assistant") return false;
+  const firstBlock = msg.content[0];
+  return firstBlock?.type === "text" && firstBlock.text.startsWith("[Context Compaction Summary]");
+}
+
+/** 计算消息列表中 summaryMsg 的偏移量（0 或 1） */
+export function summaryOffsetOf(messages: AgentMessage[]): number {
+  return messages.length > 0 && isCompactionSummary(messages[0]!) ? 1 : 0;
+}

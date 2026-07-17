@@ -14,7 +14,7 @@ This is an interactive **coding agent** that runs in the terminal. It provides a
 |-------|-----------|-------------|
 | **Agent** | `src/agent.ts` | Main agent orchestrator. Manages LLM calls, messages, streaming, and event dispatch. |
 | **Agent Loop** | `src/agent-loop.ts` | Core loop: LLM streaming, tool call execution, retry, steering messages, compaction. Driven by `runAgentLoop` / `runAgentLoopContinue`. |
-| **TUI** | `src/tui/component.ts` | Terminal UI components: TitleBar, MessageList (with folding), Footer, InputBar. Uses pi-tui. |
+| **TUI** | `src/tui/component.ts` | Terminal UI components: TitleBar (border), MessageList (with folding), Footer, InputBar, StatusBar (status+model). Uses pi-tui. |
 | **Session** | `src/session-manager.ts` | Session lifecycle: create, save, switch, fork. Integration with session-store. |
 | **Session Store** | `src/session-store.ts` | Persistence layer: tree-structured session storage in JSONL files (`~/.tca/sessions/`). |
 | **Plugin System** | `src/plugin/` | Plugin loading, runtime, and event dispatch. |
@@ -44,7 +44,7 @@ src/
 ├── event-bus.ts         # Cross-component event bus
 ├── index.ts             # Public exports
 ├── tui/
-│   ├── component.ts     # TUI components (TitleBar, MessageList, Footer, InputBar)
+│   ├── component.ts     # TUI components (TitleBar, MessageList, Footer, InputBar, StatusBar)
 │   └── index.ts         # Public exports
 ├── plugin/
 │   ├── index.ts         # Plugin system exports
@@ -66,8 +66,8 @@ cli.ts: inputBar.onSubmit
   │
   ▼
 agent.agentLoop(text)
-  ├── _messages.push(userMsg)
   ├── _agentEndEmitted = false  ← reset, allow agent_end emit
+  ├── create userMsg (不直接 push 到 _messages，由 runAgentLoop 内部 push)
   ├── broadcast("message_start")
   │
   ▼
@@ -82,14 +82,17 @@ runLoop()
   │     ├── yield "tool_call"   → broadcast("message_update" with tool_calls)
   │     └── yield "done"        → stopReason determination
   │
+  ├── push assistantMessage to currentContext.messages  ← AI 回复加入 context
+  │
   ├── executeToolCalls()         ← handles tool_execution events
-  │     └── tool result → push to context → loop back
+  │     └── tool result → push to currentContext → loop back
   │
   └── broadcast("turn_end")      ← only turn_end here, NOT agent_end
   │
   ▼
 agent.ts: agentLoop() after runAgentLoop returns
-  ├── this._messages = [...context.messages, ...allMessages]  ← update state
+  ├── sync currentContext.messages → context.messages (含 loop 内压缩结果)
+  ├── this._messages = [...context.messages]  ← update state
   ├── broadcast("agent_end", this._messages)  ← emit agent_end HERE (after state update)
   └── autoCompactIfNeeded()  ← post-turn compaction
   │
@@ -173,7 +176,7 @@ autoCompactIfNeeded()
   │     └── collects full text response (not streaming to TUI)
   │     └── returns summary string or null on error
   │
-  ├── buildCompactedMessages(messages, cutPoint, summary, systemPrompt)
+  ├── buildCompactedMessages(messages, cutPoint, summary)
   │     └── creates: [summaryMsg (assistant), ...keptMessages]
   │
   ├── _onCompaction callback → sessionMgr.appendCompaction(CompactionEntry)
@@ -248,7 +251,7 @@ Loaded from `.env` (cwd priority) or `~/.tca/.env`.
 | Function | Description |
 |----------|-------------|
 | `findCutPoint(messages, keepRecentTokens)` | From newest backward, find index where cumulative tokens >= keepRecentTokens |
-| `buildCompactedMessages(messages, cutPoint, summary, systemPrompt)` | Create [summaryMsg, ...keptMessages] |
+| `buildCompactedMessages(messages, cutPoint, summary)` | Create [summaryMsg, ...keptMessages] |
 | `buildCompactionPrompt(input)` | Serialize old messages into structured summary prompt |
 | `createCompactionEntry(summary, cutPoint, firstKeptEntryId)` | Create compaction record for JSONL storage (with entry id/parentId assigned by `appendCompactionEntry`) |
 
@@ -306,37 +309,64 @@ LLM receives this prompt when compaction is triggered:
 
 ### Plugin Interface
 
-```typescript
-export interface AgentPlugin {
-  name: string;
-  version: string;
-  description?: string;
-  tools?: Map<string, AgentTool>;
-  hooks?: PluginHooks;
-}
+插件是一个 `.ts` 或 `.js` 文件，默认导出工厂函数 `(api: ExtensionAPI) => void`：
 
-export interface PluginHooks {
-  onEvent?: (event: AgentEvent, api: PluginAPI) => void | Promise<void>;
-  onInit?: (api: PluginAPI) => void | Promise<void>;
-  onShutdown?: (api: PluginAPI) => void | Promise<void>;
+```typescript
+import type { ExtensionAPI } from "tui-coding-agent";
+
+export default function (api: ExtensionAPI) {
+  // 注册事件监听
+  api.on("agent_end", (event, ctx) => {
+    console.log(`Agent ended, ${ctx.getMessageCount()} messages`);
+  });
+
+  // 注册 LLM 工具
+  api.registerTool({
+    name: "my_tool",
+    description: "Description for LLM",
+    parameters: { type: "object", properties: {} },
+    execute: async (toolCallId, params) => ({
+      content: [{ type: "text", text: "result" }],
+    }),
+  });
+
+  // 注册 /xxx 命令
+  api.registerCommand("hello", async (ctx, args) => {
+    ctx.notify(`Hello, ${args || "World"}!`, "info");
+  }, "Say hello");
 }
 ```
 
-### PluginAPI (provided to plugins via `bindPlugins` → `bindCore`)
+### ExtensionAPI 方法
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `isIdle` | `() => boolean` | Is agent idle |
-| `abort` | `() => void` | Abort streaming |
-| `waitForIdle` | `() => Promise<void>` | Wait until idle |
-| `sendMessage` | `(content: string) => void` | Send message to agent |
-| `getActiveTools` | `() => string[]` | List enabled tools |
-| `getAllTools` | `() => string[]` | List all available tools |
+| `on` | `(event: string, handler: (...args) => void)` | Subscribe to agent lifecycle events |
+| `registerTool` | `(tool: AgentTool) => void` | Register an LLM-callable tool |
+| `registerCommand` | `(name, handler, description?) => void` | Register a `/xxx` command |
+| `notify` | `(message, type?) => void` | Show notification |
+| `exec` | `(cmd, args, cwd?) => Promise<{stdout, stderr, exitCode}>` | Execute shell command (30s timeout) |
+| `getActiveTools` | `() => string[]` | Get enabled tool names |
 | `setActiveTools` | `(names: string[]) => void` | Enable/disable tools |
-| `notify` | `(msg: string, level?: "info" \| "warning" \| "error") => void` | Send notification |
-| `getMessageCount` | `() => number` | Message count |
+| `ui` | `PluginUIContext` | UI operations (setStatus, setHeader, etc.) |
 
-### Plugin Discovery Order
+### 事件类型（`api.on` 的第一个参数）
+
+| 事件 | 触发时机 |
+|------|---------|
+| `agent_start` | Agent 开始处理一轮输入 |
+| `agent_end` | Agent 完成处理（含 `messages: AgentMessage[]`） |
+| `turn_start` | 新的一轮 LLM 交互开始 |
+| `turn_end` | 一轮交互结束（含 `message`, `toolResults`）|
+| `message_start` | 新消息开始生成 |
+| `message_update` | 流式消息增量（含 `delta: string`）|
+| `message_end` | 消息完成 |
+| `tool_execution_start` | 工具开始执行 |
+| `tool_execution_end` | 工具执行完成 |
+| `notification` | 系统通知 |
+| `context` | 上下文 token 用量报告 |
+
+### 插件发现顺序
 
 1. CLI `--plugin` args
 2. Cwd plugin dir (`<cwd>/plugins/`)
@@ -357,7 +387,7 @@ export interface PluginHooks {
 ### TUI Layout
 
 ```
-╭─ ● Ready                                          gpt-4o
+╭──────────────────────────────────────────────────────╮
 │
 ┊  ── User ──────────────  12:00:00
 ┊  你好
@@ -367,7 +397,8 @@ export interface PluginHooks {
 ┊  ⚡ bash - ls -la
 │
 ╰─ ❯ /workspace ──────────────────────────────────────
-<input cursor>
+> <input cursor>
+● Ready  gpt-4o
 ```
 
 ### Commands
@@ -392,8 +423,8 @@ export interface PluginHooks {
 |----------|--------|
 | `Ctrl+C` | Abort streaming or exit |
 | `Ctrl+O` | Toggle message folding (expand/collapse) |
-| `Ctrl+P` | Previous input history |
-| `Ctrl+N` | Next input history |
+| `↑` | Previous input history |
+| `↓` | Next input history |
 | `Esc` | Cancel current streaming turn |
 
 ## Development

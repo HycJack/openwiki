@@ -27,9 +27,10 @@ function createExtensionAPI(plugin: Plugin, runtime: PluginRuntime, cwd: string)
       plugin.handlers.set(event, list);
     },
     registerTool(tool) { plugin.tools.set(tool.name, tool); },
-    registerCommand(name, handler) {
+    registerCommand(name, handler, description) {
       plugin.commands.set(name, {
         name,
+        description,
         handler: async (ctx: PluginCommandContext, args: string) => {
           await handler(ctx, args);
         },

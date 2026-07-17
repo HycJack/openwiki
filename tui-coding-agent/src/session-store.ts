@@ -17,6 +17,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage } from "./types.js";
 import type { CompactionEntry } from "./compaction.js";
+import { sessionDir, sessionFilePath, metaFilePath } from "./session-paths.js";
 
 // ============================================================================
 // Entry 类型 — 每条 JSONL 记录可以是消息或元数据 entry
@@ -61,30 +62,6 @@ export interface TreeNode {
   entry: SessionEntry;
   children: TreeNode[];
   depth: number;
-}
-
-// ============================================================================
-// Paths
-// ============================================================================
-
-function getSessionsDir(): string {
-  return path.join(os.homedir(), ".tca", "sessions");
-}
-
-function cwdHash(cwd: string): string {
-  return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-}
-
-function sessionDir(cwd: string): string {
-  return path.join(getSessionsDir(), cwdHash(cwd));
-}
-
-function sessionFilePath(cwd: string, sessionId: string): string {
-  return path.join(sessionDir(cwd), `${sessionId}.jsonl`);
-}
-
-function metaFilePath(cwd: string, sessionId: string): string {
-  return path.join(sessionDir(cwd), `${sessionId}.meta.json`);
 }
 
 // ============================================================================

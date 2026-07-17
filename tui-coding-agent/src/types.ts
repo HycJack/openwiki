@@ -289,7 +289,7 @@ export interface ExtensionAPI {
   /** Register an LLM-callable tool */
   registerTool(tool: AgentTool): void;
   /** Register a slash command like /mycommand */
-  registerCommand(name: string, handler: (ctx: PluginCommandContext, args: string) => Promise<void>): void;
+  registerCommand(name: string, handler: (ctx: PluginCommandContext, args: string) => Promise<void>, description?: string): void;
   /** Show a notification */
   notify(message: string, type?: "info" | "warning" | "error"): void;
   /** Execute a shell command */

@@ -33,6 +33,7 @@ import {
   findCutPoint,
   buildCompactedMessages,
   buildCompactionPrompt,
+  isCompactionSummary,
   type CompactionConfig,
   type CutPoint,
   DEFAULT_COMPACTION_CONFIG,
@@ -181,7 +182,8 @@ export class Agent {
     this._abortController = new AbortController();
 
     try {
-      // Add user message (但不 push 到 this._messages，由 runAgentLoop 返回后再合并)
+      // Add user message（由 runAgentLoop 内部 push 到 currentContext.messages，
+      // 最终同步回 context.messages 即 this._messages）
       const userMsg: AgentMessage = {
         role: "user",
         content: [{ type: "text" as const, text: input }],
@@ -300,6 +302,10 @@ export class Agent {
   /**
    * 检查 context 使用量，超过阈值时自动触发 LLM 驱动的压缩。
    * 发送压缩 prompt 给 LLM，用返回的摘要替换早期消息。
+   *
+   * 两种触发场景：
+   * 1. token 用量超过阈值（shouldCompact 返回 true）— 正常压缩
+   * 2. 消息列表首条已是紧急压缩 summary（loop 内压缩过）— 强制用 LLM 摘要替换
    */
   private async autoCompactIfNeeded(): Promise<void> {
     if (this._messages.length === 0) return;
@@ -311,9 +317,15 @@ export class Agent {
     );
 
     const reserveTokens = DEFAULT_RESERVE_TOKENS;
-    if (!shouldCompact(usage, reserveTokens)) return;
+    // 即使 shouldCompact 返回 false，如果首条消息是紧急压缩 summary，
+    // 说明 loop 内已截断过，需要生成 LLM 摘要并持久化
+    const alreadyCompacted = this._messages.length > 0 && isCompactionSummary(this._messages[0]!);
 
-    const cutPoint = findCutPoint(this._messages, DEFAULT_COMPACTION_CONFIG.keepRecentTokens);
+    if (!shouldCompact(usage, reserveTokens) && !alreadyCompacted) return;
+
+    const cutPoint = alreadyCompacted
+      ? { firstKeptIndex: 1, truncatedTokens: 0, truncatedCount: 0 }
+      : findCutPoint(this._messages, DEFAULT_COMPACTION_CONFIG.keepRecentTokens);
     if (!cutPoint) return;
 
     this.notifyUI(`Auto-compacting context (${cutPoint.truncatedCount} messages)...`, "info");

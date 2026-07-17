@@ -3,7 +3,7 @@
 A plugin-based TUI coding agent — an interactive AI assistant that runs in your terminal.
 
 ```
-╭─ ● Ready                                          gpt-4o
+╭──────────────────────────────────────────────────────╮
 │
 ┊  ── User ──────────────  12:00:00
 ┊  帮我看看这个项目结构
@@ -13,6 +13,8 @@ A plugin-based TUI coding agent — an interactive AI assistant that runs in you
 ┊  ⚡ bash - ls -la
 │
 ╰─ ❯ /workspace/project ──────────────────────────────
+> <input cursor>
+● Ready  gpt-4o
 ```
 
 ## Features
@@ -22,7 +24,7 @@ A plugin-based TUI coding agent — an interactive AI assistant that runs in you
 - **Built-in tools** — bash, read, write, edit, grep, glob, ls — the agent can do real work
 - **Session management** — Conversations auto-save as JSONL files, supports branching and forking
 - **Plugin system** — Extend with custom commands and tools
-- **Input history** — `Ctrl+P` / `Ctrl+N` to browse previous inputs
+- **Input history** — `↑` / `↓` to browse previous inputs
 
 ## Quick Start
 
@@ -88,8 +90,8 @@ npm run dev -- --print "list all files in this project"
 |----------|--------|
 | `Ctrl+C` | Abort streaming or exit |
 | `Ctrl+O` | Toggle message folding |
-| `Ctrl+P` | Previous input history |
-| `Ctrl+N` | Next input history |
+| `↑` | Previous input history |
+| `↓` | Next input history |
 | `Esc` | Cancel current streaming turn |
 
 ## Sessions
@@ -214,55 +216,92 @@ What remains to be done.
 
 ## Plugin Development
 
-Plugins extend the agent with custom tools and event handlers.
+插件可以扩展 Agent 的自定义工具和 `/xxx` 命令。
 
-### Plugin Structure
+### 插件文件结构
+
+插件是一个 `.ts` 或 `.js` 文件，默认导出工厂函数：
 
 ```typescript
-import type { PluginAPI } from "tui-agent-refactor";
+// plugins/my-plugin.ts
+import type { ExtensionAPI } from "tui-agent-refactor";
 
-export default {
-  name: "my-plugin",
-  version: "0.1.0",
-  tools: [
-    {
-      name: "my-tool",
-      description: "Does something useful",
-      parameters: { type: "object", properties: { ... } },
-      execute: async (id, args) => {
-        // tool logic
-        return { content: [{ type: "text", text: "done" }] };
-      },
+export default function (api: ExtensionAPI) {
+  // 注册 /hello 命令
+  api.registerCommand("hello", async (ctx, args) => {
+    ctx.notify(`Hello, ${args || "World"}!`, "info");
+  }, "Say hello");
+
+  // 注册 LLM 工具
+  api.registerTool({
+    name: "my_tool",
+    description: "Does something useful",
+    parameters: {
+      type: "object",
+      properties: { input: { type: "string" } },
+      required: ["input"],
     },
-  ],
-  hooks: {
-    onMessage: async (event, api) => { ... },
-  },
-};
+    execute: async (toolCallId, params) => ({
+      content: [{ type: "text", text: `Processed: ${params.input}` }],
+    }),
+  });
+
+  // 订阅 Agent 事件
+  api.on("agent_end", (event, ctx) => {
+    console.log(`[plugin] Agent finished. Messages: ${ctx.getMessageCount()}`);
+  });
+}
 ```
 
-### Loading Plugins
+### 加载插件
 
 ```bash
-# Via CLI
-npm run dev -- --plugin ./path/to/plugin.js
+# 通过 CLI
+npm run dev -- --plugin ./plugins/my-plugin.ts
 
-# Via config
-# Add to ~/.tca/config.json: { "plugins": ["./path/to/plugin.js"] }
+# 放到项目插件目录（自动发现）
+mkdir .tca/plugins
+cp my-plugin.ts .tca/plugins/
+
+# 放到全局插件目录（自动发现）
+mkdir -p ~/.tca/plugins
+cp my-plugin.ts ~/.tca/plugins/
 ```
 
-### Plugin API
+### ExtensionAPI 方法
 
-The plugin runtime provides:
+| 方法 | 参数 | 说明 |
+|------|------|------|
+| `api.on(event, handler)` | `event`: 事件名, `handler`: 处理函数 | 订阅 Agent 生命周期事件 |
+| `api.registerTool(tool)` | `AgentTool` | 注册 LLM 可调用的工具 |
+| `api.registerCommand(name, handler, description?)` | 命令名, 处理函数, 描述 | 注册 `/xxx` 命令 |
+| `api.notify(message, type?)` | `type`: `"info"` / `"warning"` / `"error"` | 发送通知 |
+| `api.exec(cmd, args, cwd?)` | Shell 命令 | 执行命令（30s 超时） |
+| `api.getActiveTools()` | — | 获取已启用工具 |
+| `api.setActiveTools(names)` | `string[]` | 启用/禁用工具 |
+| `api.ui` | PluginUIContext | UI 操作（setStatus 等） |
 
-- `isIdle()` — whether the agent is idle (not streaming)
-- `abort()` — abort the current streaming turn
-- `waitForIdle()` — resolve when the agent becomes idle
-- `sendMessage(text)` — send a message to the agent
-- `getActiveTools()` / `getAllTools()` — list available tools
-- `setActiveTools(names)` — enable/disable specific tools
-- `notify(message, level)` — send a notification to the UI
-- `getMessageCount()` — total message count
+### 可用事件
+
+`api.on()` 可监听以下事件：
+- `agent_start` / `agent_end` — Agent 会话开始/结束
+- `turn_start` / `turn_end` — 每一轮 LLM 交互开始/结束
+- `message_start` / `message_update` / `message_end` — 消息生成过程
+- `tool_execution_start` / `tool_execution_end` — 工具执行过程
+- `notification` — 系统通知
+- `context` — 上下文 token 用量
+
+### 示例：Git 操作插件
+
+项目自带 [plugins/git-operations.ts](./plugins/git-operations.ts) 作为完整示例，提供：
+- LLM 工具：`git_status`、`git_log`、`git_diff`、`git_branches`
+- 命令：`/git`、`/git-log`、`/git-status`、`/git-diff`
+
+```bash
+# 加载 git 插件
+npm run dev -- --plugin ./plugins/git-operations.ts
+```
+
 
 ## Development
 

@@ -19,6 +19,7 @@ import {
   getPluginDir,
   getGlobalPluginDir,
   createPluginRunner,
+  PluginRunner,
 } from "./plugin/index.js";
 import { streamOpenAI } from "./providers/openai.js";
 import { createChatTUI } from "./tui/index.js";
@@ -33,6 +34,8 @@ import {
   buildCompactedMessages,
   buildCompactionPrompt,
   createCompactionEntry,
+  isCompactionSummary,
+  summaryOffsetOf,
 } from "./compaction.js";
 import { convertToLlm } from "./llm.js";
 import type { AgentTool, ModelConfig, TextContent, AgentMessage, AgentEvent } from "./types.js";
@@ -40,18 +43,6 @@ import type { AgentTool, ModelConfig, TextContent, AgentMessage, AgentEvent } fr
 // ============================================================================
 // 参数解析
 // ============================================================================
-
-/** 检测消息是否为 compaction summary（由 buildCompactedMessages 生成） */
-function isCompactionSummary(msg: AgentMessage): boolean {
-  if (msg.role !== "assistant") return false;
-  const firstBlock = msg.content[0];
-  return firstBlock?.type === "text" && firstBlock.text.startsWith("[Context Compaction Summary]");
-}
-
-/** 计算 agent._messages 中 summaryMsg 的偏移量（0 或 1） */
-function summaryOffsetOf(messages: AgentMessage[]): number {
-  return messages.length > 0 && isCompactionSummary(messages[0]!) ? 1 : 0;
-}
 
 interface CliArgs {
   model?: string;
@@ -188,8 +179,10 @@ async function main(): Promise<void> {
   // autoCompactIfNeeded 完成后，将 CompactionEntry 追加到 session JSONL
   agent.setCompactionCallback(async (summary, cutPoint, keptMessages) => {
     // 找到 firstKeptEntryId：cutPoint.firstKeptIndex 是 agent._messages 索引，需要映射到 entry id
-    // 若 agent._messages 以 summaryMsg 开头（二次压缩），需扣除偏移
-    const summaryOffset = summaryOffsetOf(keptMessages);
+    // 通过检查 agent（而非 keptMessages）判断是否有 summary 偏移，
+    // 因为 keptMessages 是 compacted 结果（一定以 summary 开头），
+    // 但 agent._messages 在回调执行时尚未更新
+    const summaryOffset = summaryOffsetOf(agent.state.messages);
     const firstKeptEntryId = sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex, summaryOffset);
     if (!firstKeptEntryId) {
       throw new Error("Cannot find firstKeptEntryId for compaction");
@@ -247,6 +240,21 @@ async function main(): Promise<void> {
     },
   });
 
+  // 绑定插件 TUI Slot API，允许插件控制 TUI 组件
+  pluginRunner.bindSlotAPI({
+    setHeader: (content, component) => content && chat.tui.requestRender(),
+    setFooter: (content, component) => content && chat.tui.requestRender(),
+    setWidget: (key, content, options) => content && chat.tui.requestRender(),
+    setStatus: (key, text) => {
+      if (text) chat.statusBar.modelLabel = text;
+      chat.tui.requestRender();
+    },
+    setTitle: (title) => {
+      chat.statusBar.modelLabel = title;
+      chat.tui.requestRender();
+    },
+  });
+
   // Esc 取消当前轮对话
   chat.inputBar.onCancel = () => {
     if (agent.state.isStreaming) {
@@ -262,7 +270,8 @@ async function main(): Promise<void> {
 
     // 处理命令
     if (cmd.startsWith("/")) {
-      await handleCommand(cmd, { agent, chat, config: userConfig, model, cwd, allTools, sessionMgr });
+      chat.inputBar.clear();
+      await handleCommand(cmd, { agent, chat, config: userConfig, model, cwd, allTools, sessionMgr, pluginRunner });
       return;
     }
 
@@ -291,7 +300,7 @@ async function main(): Promise<void> {
       case "turn_end":
         // 整轮结束，重置流式状态并刷新
         chat.messageList.streamingMessage = null;
-        // 从 context.messages 获取最新消息
+        // 从 agent.state.messages 获取最新消息（含本轮 AI 回复和 tool 结果）
         chat.updateMessages(agent.state.messages);
         // 额外重绘确保显示
         chat.tui.requestRender();
@@ -332,6 +341,7 @@ interface CommandCtx {
   cwd: string;
   allTools: AgentTool[];
   sessionMgr: SessionManager;
+  pluginRunner: PluginRunner;
 }
 
 async function handleCommand(cmd: string, ctx: CommandCtx): Promise<void> {
@@ -387,6 +397,8 @@ async function handleCommand(cmd: string, ctx: CommandCtx): Promise<void> {
       return;
 
     default:
+      // 尝试插件注册的命令
+      if (await ctx.pluginRunner.executeCommand(name, args.join(" "))) return;
       ctx.chat.setStatus(`Unknown command: ${name}. Type /help`, "error");
       setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
   }
@@ -415,6 +427,14 @@ function showHelp(ctx: CommandCtx): void {
     `${dim("Model: " + (ctx.config.defaultModel ?? ctx.model.id))}`,
   ];
 
+  const pluginCmds = ctx.pluginRunner.getRegisteredCommands();
+  if (pluginCmds.length > 0) {
+    lines.push(dim("── Plugin Commands ────────────────────────────────────────"));
+    for (const cmd of pluginCmds) {
+      lines.push(`${hl("/" + cmd.name)}     ${cmd.description ? dim(cmd.description) : ""}`);
+    }
+    lines.push(dim("────────────────────────────────────────────────────"));
+  }
   console.log(lines.join("\n"));
 }
 
