@@ -402,6 +402,15 @@ export function forkFromEntry(
   currentEntryId: string,
   message: Omit<AgentMessage, "id" | "parentId">,
 ): { entry: SessionEntry; id: string } {
+  // 验证 fork 点存在
+  const found = entries.some((e) => {
+    const entryWithMeta = e as SessionEntry;
+    return "id" in entryWithMeta && entryWithMeta.id === currentEntryId;
+  });
+  if (!found) {
+    throw new Error(`Fork point not found: ${currentEntryId}`);
+  }
+
   const id = generateId();
   const entry: SessionEntry = { ...message, id, parentId: currentEntryId } as SessionEntry & SessionEntryMeta;
   return { entry, id };

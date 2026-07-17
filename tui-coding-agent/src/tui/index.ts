@@ -10,10 +10,11 @@
  * - createChatTUI 一键创建入口
  */
 
-export { MessageList, TitleBar, Footer, InputBar, StatusBar, createChatTUI, defaultMDTheme } from "./component.js";
+export { MessageList, TitleBar, Footer, InputBar, StatusBar, CommandPalette, createChatTUI, defaultMDTheme } from "./component.js";
 export type {
   StatusType,
   InputBarOptions,
   ChatTUI,
   CreateChatTUIOptions,
+  CommandPaletteItem,
 } from "./component.js";

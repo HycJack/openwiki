@@ -373,6 +373,46 @@ export class SessionManager {
     return null;
   }
 
+  /**
+   * 追加一条自定义条目到 session 的 JSONL。
+   * 存储为 role="custom" 的消息，保留 customType 和 data 字段。
+   */
+  async appendCustomEntry(type: string, data: unknown): Promise<void> {
+    const parentId = this._lastEntryId;
+    const customMsg: AgentMessage = {
+      role: "custom",
+      content: [],
+      customType: type,
+      data,
+    } as unknown as AgentMessage;
+
+    const newId = await appendSessionEntry(this.cwd, this._sessionId, customMsg, parentId);
+
+    // 刷新 entries 和 lastEntryId
+    this._entries = await loadSessionEntries(
+      sessionFilePath(this.cwd, this._sessionId),
+    );
+    this._lastEntryId = newId;
+  }
+
+  /**
+   * 读取当前 branch 中所有指定 type 的自定义条目。
+   */
+  getCustomEntries(type: string): { data: unknown; id: string; parentId: string | null }[] {
+    const results: { data: unknown; id: string; parentId: string | null }[] = [];
+    for (const e of this._entries) {
+      const entry = e as unknown as Record<string, unknown>;
+      if ((entry as { role?: string }).role === "custom" && (entry as { customType?: string }).customType === type) {
+        results.push({
+          data: (entry as { data?: unknown }).data,
+          id: (entry as { id?: string }).id as string,
+          parentId: ((entry as { parentId?: string | null }).parentId as string) ?? null,
+        });
+      }
+    }
+    return results;
+  }
+
   // ============================================================================
   // 树与列表
   // ============================================================================

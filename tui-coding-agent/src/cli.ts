@@ -205,6 +205,8 @@ async function main(): Promise<void> {
       console.log(`${prefix} ${m}`);
       agent.notifyUI(m, t ?? "info");
     },
+    appendEntry: (type, data) => { sessionMgr.appendCustomEntry(type, data).catch(() => {}); },
+    getCustomEntries: (type) => sessionMgr.getCustomEntries(type),
     getMessageCount: () => agent.state.messageCount,
   });
 
@@ -230,6 +232,7 @@ async function main(): Promise<void> {
   // 交互模式 — 使用 pi-mono 风格 TUI
   const chat = createChatTUI({
     modelLabel: model.id,
+    commands: buildCommandList(pluginRunner),
     onCtrlC() {
       if (agent.state.isStreaming) {
         agent.abort();
@@ -397,11 +400,31 @@ async function handleCommand(cmd: string, ctx: CommandCtx): Promise<void> {
       return;
 
     default:
-      // 尝试插件注册的命令
-      if (await ctx.pluginRunner.executeCommand(name, args.join(" "))) return;
+      // 尝试插件注册的命令（去掉 / 前缀）
+      const cmdName = name.startsWith("/") ? name.slice(1) : name;
+      if (await ctx.pluginRunner.executeCommand(cmdName, args.join(" "))) return;
       ctx.chat.setStatus(`Unknown command: ${name}. Type /help`, "error");
       setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
   }
+}
+
+/** 构建命令选择面板的列表 */
+function buildCommandList(pluginRunner: PluginRunner): { name: string; description?: string }[] {
+  const builtinCmds: { name: string; description?: string }[] = [
+    { name: "exit", description: "Exit the application" },
+    { name: "help", description: "Show available commands" },
+    { name: "clear", description: "Clear screen" },
+    { name: "model", description: "Switch model: /model [provider:id]" },
+    { name: "tokens", description: "Show token usage" },
+    { name: "ctx", description: "Context overview" },
+    { name: "compact", description: "Compact conversation with LLM summary" },
+    { name: "sessions", description: "List all sessions" },
+    { name: "session", description: "Switch session: /session <id> | new" },
+    { name: "tree", description: "Show session tree" },
+    { name: "fork", description: "Fork session: /fork <entry-id>" },
+  ];
+  const pluginCmds = pluginRunner.getRegisteredCommands();
+  return [...builtinCmds, ...pluginCmds.map((c) => ({ name: c.name, description: c.description }))];
 }
 
 function showHelp(ctx: CommandCtx): void {
@@ -618,23 +641,39 @@ async function handleSessionsCommand(ctx: CommandCtx): Promise<void> {
     return;
   }
 
-  const lines = [
-    `\x1b[90m── Sessions ────────────────────────────\x1b[0m`,
-  ];
-
-  for (const s of sessions) {
+  const items = sessions.map((s) => {
     const name = s.meta.name ?? s.meta.id.slice(0, 12);
     const date = new Date(s.meta.updatedAt).toLocaleString();
-    const msgCount = s.meta.messageCount;
-    const marker = s.isCurrent ? ` \x1b[33m◀ current\x1b[0m` : "";
-    lines.push(
-      `  \x1b[33m${s.meta.id.slice(0, 12)}\x1b[0m  \x1b[1m${name}\x1b[0m  \x1b[90m${date}\x1b[0m  ${msgCount} msgs${marker}`,
-    );
-  }
+    const marker = s.isCurrent ? "◀ current " : "";
+    return {
+      name: s.meta.id,
+      description: `${marker}${name}  ${date}  ${s.meta.messageCount} msgs`,
+    };
+  });
 
-  lines.push(`\x1b[90m──────────────────────────────────────\x1b[0m`);
-  lines.push(`\x1b[90mUse /session <id> to switch, /session new to create.\x1b[0m`);
-  console.log(lines.join("\n"));
+  ctx.chat.showCommandPalette(items, {
+    onSelect: async (sessionId: string) => {
+      const target = sessions.find((s) => s.meta.id === sessionId);
+      if (!target) return;
+
+      ctx.chat.hideCommandPalette();
+      ctx.chat.setStatus(`Switching to session ${sessionId.slice(0, 12)}...`, "streaming");
+
+      try {
+        const messages = await ctx.sessionMgr.switchTo(target.meta.id);
+        ctx.agent.setMessages(messages);
+        ctx.chat.updateMessages(messages);
+        ctx.chat.setStatus(`Session: ${sessionId.slice(0, 12)}`, "idle");
+      } catch (err) {
+        ctx.chat.setStatus(`Failed to switch session: ${err}`, "error");
+        setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
+      }
+    },
+    onCancel: () => {
+      ctx.chat.hideCommandPalette();
+      ctx.chat.setStatus("Ready", "idle");
+    },
+  });
 }
 
 async function handleSessionCommand(args: string[], ctx: CommandCtx): Promise<void> {

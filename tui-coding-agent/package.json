@@ -15,7 +15,8 @@
     "start": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
-    "test": "node --experimental-vm-modules --test src/**/*.test.ts"
+    "esbuild": "npx esbuild src/cli.ts --bundle --platform=node --outfile=dist/cli.js",
+    "test": "npx tsx --test \"test/*.test.ts\""
   },
   "keywords": [
     "tui",

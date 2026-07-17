@@ -39,6 +39,7 @@ import {
   truncateToWidth,
   type Component,
   type MarkdownTheme,
+  type OverlayHandle,
 } from "@earendil-works/pi-tui";
 import type { AgentMessage, TextContent, ContentBlock } from "../types.js";
 
@@ -178,6 +179,126 @@ export class Footer implements Component {
     if (lineLen > width) return [truncateToWidth(line, width)];
     const sep = `${C.dim}─${C.reset}`.repeat(Math.max(0, width - lineLen));
     return [truncateToWidth(line + sep, width)];
+  }
+}
+
+// ============================================================================
+// CommandPalette — 命令选择弹出层
+// ============================================================================
+
+export interface CommandPaletteItem {
+  name: string;
+  description?: string;
+}
+
+/**
+ * 命令选择列表，适配 TUI Component 接口。
+ * 可作为 overlay 使用，支持 ↑↓ 导航、Enter 选择、Esc 取消。
+ *
+ * 支持临时覆盖 onSelect/onCancel：在显示 overlay 前设置 override，
+ * handleInput 完成后自动清除（一次性的），避免污染后续复用。
+ */
+export class CommandPalette implements Component {
+  private allItems: CommandPaletteItem[] = [];
+  private filtered: { value: string; label: string; description?: string }[] = [];
+  private selectedIndex = 0;
+  private _filterText = "";
+
+  /** 选中回调（永久） */
+  onSelect?: (name: string) => void;
+  /** 取消回调（永久） */
+  onCancel?: () => void;
+
+  /** 临时覆盖 onSelect（一次性的，触发后自动清除） */
+  onSelectOverride?: ((name: string) => void) | null;
+  /** 临时覆盖 onCancel（一次性的，触发后自动清除） */
+  onCancelOverride?: (() => void) | null;
+
+  /** 请求重绘（由 TUI 绑定） */
+  requestRender: (() => void) | null = null;
+
+  setCommands(cmds: CommandPaletteItem[]): void {
+    this.allItems = cmds;
+    this.applyFilter();
+  }
+
+  /** 设置 filter 文本 */
+  setFilter(text: string): void {
+    this._filterText = text;
+    this.applyFilter();
+    if (this.selectedIndex >= this.filtered.length) {
+      this.selectedIndex = Math.max(0, this.filtered.length - 1);
+    }
+  }
+
+  private applyFilter(): void {
+    const ft = this._filterText;
+    this.filtered = this.allItems
+      .filter((c) => !ft || c.name.includes(ft) || (c.description?.includes(ft)))
+      .map((c) => ({ value: c.name, label: c.name, description: c.description }));
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const maxH = Math.min(this.filtered.length, 10);
+    if (maxH === 0) {
+      return [` ${C.dim}No matching commands${C.reset}`];
+    }
+
+    const lines: string[] = [];
+    const start = Math.max(0, this.selectedIndex - 4);
+    const end = Math.min(this.filtered.length, start + 10);
+    const visible = this.filtered.slice(start, end);
+
+    for (let i = 0; i < visible.length; i++) {
+      const item = visible[i]!;
+      const isSelected = start + i === this.selectedIndex;
+      const prefix = isSelected ? `${C.cyan}▸${C.reset} ` : "  ";
+      const label = isSelected ? `${C.cyan}${item.label}${C.reset}` : item.label;
+      const desc = item.description ? ` ${C.gray}${item.description}${C.reset}` : "";
+      const line = prefix + label + desc;
+      lines.push(visibleWidth(line) > width ? truncateToWidth(line, width) : line);
+    }
+
+    // 滚动提示
+    if (this.filtered.length > end) {
+      lines.push(` ${C.dim}↓ ${this.filtered.length - end} more${C.reset}`);
+    }
+
+    return lines;
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, "down") || matchesKey(data, "ctrl+n")) {
+      if (this.selectedIndex < this.filtered.length - 1) {
+        this.selectedIndex++;
+        this.requestRender?.();
+      }
+      return;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "ctrl+p")) {
+      if (this.selectedIndex > 0) {
+        this.selectedIndex--;
+        this.requestRender?.();
+      }
+      return;
+    }
+    if (matchesKey(data, "enter")) {
+      const sel = this.filtered[this.selectedIndex];
+      if (sel) {
+        const cb = this.onSelectOverride ?? this.onSelect;
+        this.onSelectOverride = null;
+        cb?.(sel.value);
+      }
+      return;
+    }
+    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+      const cb = this.onCancelOverride ?? this.onCancel;
+      this.onCancelOverride = null;
+      cb?.();
+      return;
+    }
   }
 }
 
@@ -410,16 +531,25 @@ export interface ChatTUI {
   footer: Footer;
   inputBar: InputBar;
   statusBar: StatusBar;
+  commandPalette: CommandPalette;
   updateMessages: (messages: AgentMessage[]) => void;
   appendStreamingDelta: (delta: string) => void;
   setStatus: (text: string, type?: StatusType) => void;
   setModelLabel: (label: string) => void;
+  /** 显示命令选择弹出层 */
+  showCommandPalette: (commands: CommandPaletteItem[], options?: { onSelect?: (name: string) => void; onCancel?: () => void }) => void;
+  /** 隐藏命令选择弹出层 */
+  hideCommandPalette: () => void;
+  /** 设置命令选择弹出层的 filter 文本 */
+  setCommandFilter: (text: string) => void;
   stop: () => void;
 }
 
 export interface CreateChatTUIOptions {
   modelLabel?: string;
   cwd?: string;
+  /** 内置命令列表（用于命令选择弹出层） */
+  commands?: CommandPaletteItem[];
   onCtrlC?: (chat: ChatTUI) => boolean | void;
 }
 
@@ -443,6 +573,11 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
   const inputBar = new InputBar();
   const statusBar = new StatusBar();
 
+  // 命令选择面板
+  const commandPalette = new CommandPalette();
+  let commandOverlay: OverlayHandle | null = null;
+  const defaultCommands = opts.commands ?? [];
+
   // 输入历史（方向键导航）
   const inputHistory: string[] = [];
   let historyIndex = -1;
@@ -463,13 +598,12 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
   function historyPrev(): void {
     if (inputHistory.length === 0) return;
     if (historyIndex < 0) {
-      // 第一次按下，保存当前输入
       historySavedValue = inputBar.input.getValue();
       historyIndex = inputHistory.length - 1;
     } else if (historyIndex > 0) {
       historyIndex--;
     } else {
-      return; // 已经在最旧记录
+      return;
     }
     inputBar.input.setValue(inputHistory[historyIndex]!);
     tui.requestRender();
@@ -481,12 +615,33 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
       historyIndex++;
       inputBar.input.setValue(inputHistory[historyIndex]!);
     } else {
-      // 到达最新记录，恢复保存的值
       historyIndex = -1;
       inputBar.input.setValue(historySavedValue);
     }
     tui.requestRender();
   }
+
+  // 命令选择回调
+  commandPalette.onSelect = (name: string) => {
+    if (commandOverlay) {
+      commandOverlay.hide();
+      commandOverlay = null;
+    }
+    inputBar.input.setValue("/" + name + " ");
+    tui.setFocus(inputBar.input);
+    tui.requestRender();
+  };
+  commandPalette.onCancel = () => {
+    if (commandOverlay) {
+      commandOverlay.hide();
+      commandOverlay = null;
+    }
+    tui.setFocus(inputBar.input);
+    tui.requestRender();
+  };
+
+  // 绑定 CommandPalette 的重绘请求
+  commandPalette.requestRender = () => tui.requestRender();
 
   if (opts.modelLabel) {
     statusBar.modelLabel = opts.modelLabel;
@@ -523,39 +678,42 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
       return undefined;
     }
 
-    // ↑/↓ 输入历史导航
-    if (matchesKey(data, "up")) {
-      historyPrev();
-      return undefined;
-    }
-    if (matchesKey(data, "down")) {
-      historyNext();
-      return undefined;
+    // ↑/↓ 输入历史导航（仅在不显示命令面板时）
+    if (!commandOverlay) {
+      if (matchesKey(data, "up")) {
+        historyPrev();
+        return undefined;
+      }
+      if (matchesKey(data, "down")) {
+        historyNext();
+        return undefined;
+      }
     }
 
-    // 输入 / 开头时显示命令提示
-    // 延迟检查，让 Input 组件先处理字符
+    // 检测用户输入 "/" 时弹出命令选择面板
     setTimeout(() => {
       const inputText = inputBar.input.getValue();
-      if (inputText.startsWith("/")) {
-        const cmds = [
-          "/exit", "/help", "/clear", "/model",
-          "/tokens", "/ctx", "/compact",
-          "/sessions", "/session",
-          "/tree", "/fork",
-        ];
-        const matched = cmds.filter((c) => c.startsWith(inputText));
-        if (matched.length > 0) {
-          footer.commandHint = `${C.yellow}${matched.join("  ")}${C.reset}`;
-        } else {
-          footer.commandHint = `${C.dim}Unknown command. Type /help${C.reset}`;
-        }
+      if (inputText === "/" && defaultCommands.length > 0 && !commandOverlay) {
+        commandPalette.setCommands(defaultCommands);
+        commandPalette.setFilter("");
+        commandOverlay = tui.showOverlay(commandPalette, {
+          anchor: "bottom-left",
+          offsetX: 0,
+          offsetY: -1, // 在输入框上方
+          width: "50%",
+          maxHeight: 12,
+        });
         tui.requestRender();
-      } else {
-        if (footer.commandHint) {
-          footer.commandHint = "";
-          tui.requestRender();
-        }
+      } else if (commandOverlay && !inputText.startsWith("/")) {
+        // 用户删除了 "/"，关闭面板
+        commandOverlay.hide();
+        commandOverlay = null;
+        tui.requestRender();
+      } else if (commandOverlay && inputText.startsWith("/")) {
+        // 更新 filter
+        const filterText = inputText.slice(1); // 去掉 "/"
+        commandPalette.setFilter(filterText);
+        tui.requestRender();
       }
     }, 0);
     return undefined;
@@ -570,6 +728,7 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
     footer,
     inputBar,
     statusBar,
+    commandPalette,
     updateMessages(messages: AgentMessage[]) {
       messageList.messages = messages;
       messageList.streamingMessage = null;
@@ -588,6 +747,35 @@ export function createChatTUI(opts: CreateChatTUIOptions = {}): ChatTUI {
     },
     setModelLabel(label: string) {
       statusBar.modelLabel = label;
+      tui.requestRender();
+    },
+    showCommandPalette(commands: CommandPaletteItem[], options?: { onSelect?: (name: string) => void; onCancel?: () => void }) {
+      if (commandOverlay) {
+        commandOverlay.hide();
+        commandOverlay = null;
+      }
+      commandPalette.setCommands(commands);
+      // 设置临时覆盖回调
+      if (options?.onSelect) commandPalette.onSelectOverride = options.onSelect;
+      if (options?.onCancel) commandPalette.onCancelOverride = options.onCancel;
+      commandOverlay = tui.showOverlay(commandPalette, {
+        anchor: "bottom-left",
+        offsetX: 0,
+        offsetY: -1,
+        width: "50%",
+        maxHeight: 12,
+      });
+      tui.requestRender();
+    },
+    hideCommandPalette() {
+      if (commandOverlay) {
+        commandOverlay.hide();
+        commandOverlay = null;
+        tui.requestRender();
+      }
+    },
+    setCommandFilter(text: string) {
+      commandPalette.setFilter(text);
       tui.requestRender();
     },
     stop() {

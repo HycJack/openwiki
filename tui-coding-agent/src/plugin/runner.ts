@@ -60,6 +60,8 @@ export class PluginRunner {
     getAllTools: () => string[];
     setActiveTools: (t: string[]) => void;
     notify: (m: string, t?: "info" | "warning" | "error") => void;
+    appendEntry?: (type: string, data: unknown) => void;
+    getCustomEntries?: (type: string) => { data: unknown; id: string; parentId: string | null }[];
     getContextUsage?: () => ContextUsage | null;
     compact?: (options?: { instructions?: string }) => void;
     getMessageCount?: () => number;
@@ -73,6 +75,8 @@ export class PluginRunner {
     this.runtime.getAllTools = actions.getAllTools;
     this.runtime.setActiveTools = actions.setActiveTools;
     this.runtime.notify = actions.notify;
+    if (actions.appendEntry) this.runtime.appendEntry = actions.appendEntry;
+    if (actions.getCustomEntries) this.runtime.getCustomEntries = actions.getCustomEntries;
     if (actions.getContextUsage) this.getContextUsageFn = actions.getContextUsage;
     if (actions.compact) this.compactFn = actions.compact;
     if (actions.getMessageCount) this.getMessageCountFn = actions.getMessageCount;

@@ -298,6 +298,10 @@ export interface ExtensionAPI {
   getActiveTools(): string[];
   /** Set which tools are active */
   setActiveTools(toolNames: string[]): void;
+  /** Append a custom entry to the session store (persisted in JSONL) */
+  appendEntry(type: string, data: unknown): void;
+  /** Read all custom entries of a given type from the current session branch */
+  getCustomEntries(type: string): { data: unknown; id: string; parentId: string | null }[];
   /** UI helpers */
   readonly ui: PluginUIContext;
 }
@@ -337,6 +341,8 @@ export interface PluginRuntime {
   getAllTools: () => string[];
   setActiveTools: (toolNames: string[]) => void;
   notify: (message: string, type?: "info" | "warning" | "error") => void;
+  appendEntry?: (type: string, data: unknown) => void;
+  getCustomEntries?: (type: string) => { data: unknown; id: string; parentId: string | null }[];
   setStatus?: (key: string, text: string | undefined) => void;
   setWidget?: (key: string, content: string[] | undefined, options?: { placement?: WidgetPlacement; component?: Component }) => void;
   setHeader?: (content: string[] | undefined, component?: Component) => void;

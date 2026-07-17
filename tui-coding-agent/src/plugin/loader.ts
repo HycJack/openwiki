@@ -55,6 +55,8 @@ function createExtensionAPI(plugin: Plugin, runtime: PluginRuntime, cwd: string)
     },
     getActiveTools: () => runtime.getActiveTools(),
     setActiveTools: (t) => runtime.setActiveTools(t),
+    appendEntry: (type, data) => runtime.appendEntry?.(type, data),
+    getCustomEntries: (type) => runtime.getCustomEntries?.(type) ?? [],
     get ui() { return ui; },
   };
 }
@@ -86,7 +88,9 @@ export async function loadPlugin(
   runtime: PluginRuntime,
 ): Promise<{ plugin: Plugin | null; error: string | null }> {
   try {
-    const resolvedPath = path.resolve(cwd, pluginPath);
+    // Windows: URL.pathname 可能以 \ 开头（如 \C:\Users\...），规范化
+    const normalCwd = path.win32 ? cwd.replace(/^\\[a-zA-Z]:/, (m) => m.slice(1)) : cwd;
+    const resolvedPath = path.resolve(normalCwd, pluginPath);
     const fileUrl = pathToFileURL(resolvedPath).href;
     await ensurePluginDeps(path.dirname(resolvedPath));
 
