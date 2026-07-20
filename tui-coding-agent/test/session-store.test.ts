@@ -14,7 +14,8 @@ import {
   forkFromEntry,
   type SessionEntry,
 } from "../src/session-store.js";
-import type { AgentMessage, CompactionEntry } from "../src/session-store.js";
+import type { AgentMessage } from "../src/types.js";
+import type { CompactionEntry } from "../src/compaction.js";
 
 /** 创建一条用户消息 entry */
 function userEntry(id: string, parentId: string | null, text: string): SessionEntry {

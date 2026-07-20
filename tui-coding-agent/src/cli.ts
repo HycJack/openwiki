@@ -19,40 +19,22 @@ import {
   getPluginDir,
   getGlobalPluginDir,
   createPluginRunner,
-  PluginRunner,
 } from "./plugin/index.js";
 import { streamOpenAI } from "./providers/openai.js";
 import { createChatTUI } from "./tui/index.js";
-import type { ChatTUI } from "./tui/index.js";
 import { SessionManager } from "./session-manager.js";
-import type { SessionMeta } from "./session-store.js";
 import { loadEnv } from "./env.js";
-import { loadConfig, TCAConfig } from "./config.js";
-import { estimateContextUsage } from "./token-estimate.js";
+import { loadConfig } from "./config.js";
 import {
-  findCutPoint,
-  buildCompactedMessages,
-  buildCompactionPrompt,
   createCompactionEntry,
-  isCompactionSummary,
   summaryOffsetOf,
 } from "./compaction.js";
-import { convertToLlm } from "./llm.js";
-import type { AgentTool, ModelConfig, TextContent, AgentMessage, AgentEvent } from "./types.js";
+import type { AgentTool, ModelConfig, TextContent } from "./types.js";
+import { CommandRegistry, registerAllCommands, type CommandCtx, type CliArgs } from "./commands/index.js";
 
 // ============================================================================
 // 参数解析
 // ============================================================================
-
-interface CliArgs {
-  model?: string;
-  provider?: string;
-  baseURL?: string;
-  print?: string;
-  plugins?: string[];
-  cwd?: string;
-  help?: boolean;
-}
 
 function parseArgs(argv: string[]): CliArgs {
   const args: CliArgs = {};
@@ -110,6 +92,16 @@ async function resolveModelConfig(args: CliArgs): Promise<ModelConfig> {
 }
 
 // ============================================================================
+// 注册内置命令
+// ============================================================================
+
+function createCommandRegistry(): CommandRegistry {
+  const registry = new CommandRegistry();
+  registerAllCommands(registry);
+  return registry;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -158,8 +150,10 @@ async function main(): Promise<void> {
   // 创建插件 runner
   const pluginRunner = createPluginRunner(loadResult, pluginRuntime, { cwd, model, systemPrompt });
 
-  // 创建 Agent — 传入 streamLLM provider（默认用 streamOpenAI）
-  // onCompaction 回调在 sessionMgr 初始化后注入
+  // 创建命令注册表
+  const commandRegistry = createCommandRegistry();
+
+  // 创建 Agent
   const agent = new Agent({
     systemPrompt,
     model,
@@ -167,21 +161,15 @@ async function main(): Promise<void> {
     streamLLM: streamOpenAI,
   });
 
-  // 初始化 SessionManager — 自动加载/创建最新 session
+  // 初始化 SessionManager
   const sessionMgr = new SessionManager({ cwd, modelId: model.id });
   const savedMessages = await sessionMgr.init();
   if (!sessionMgr.isNew && savedMessages.length > 0) {
-    // 恢复历史上下文
     agent.setMessages(savedMessages);
   }
 
-  // 注入 compaction 持久化回调（参考 pi-mono 的 appendCompaction）
-  // autoCompactIfNeeded 完成后，将 CompactionEntry 追加到 session JSONL
+  // 注入 compaction 持久化回调
   agent.setCompactionCallback(async (summary, cutPoint, keptMessages) => {
-    // 找到 firstKeptEntryId：cutPoint.firstKeptIndex 是 agent._messages 索引，需要映射到 entry id
-    // 通过检查 agent（而非 keptMessages）判断是否有 summary 偏移，
-    // 因为 keptMessages 是 compacted 结果（一定以 summary 开头），
-    // 但 agent._messages 在回调执行时尚未更新
     const summaryOffset = summaryOffsetOf(agent.state.messages);
     const firstKeptEntryId = sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex, summaryOffset);
     if (!firstKeptEntryId) {
@@ -223,16 +211,15 @@ async function main(): Promise<void> {
           .join("");
         process.stdout.write(text);
       }
-      // 过滤图片：不打印 base64
     });
     await agent.agentLoop(args.print);
     return;
   }
 
-  // 交互模式 — 使用 pi-mono 风格 TUI
+  // 交互模式 — TUI
   const chat = createChatTUI({
     modelLabel: model.id,
-    commands: buildCommandList(pluginRunner),
+    commands: commandRegistry.buildCommandList(pluginRunner),
     onCtrlC() {
       if (agent.state.isStreaming) {
         agent.abort();
@@ -243,12 +230,24 @@ async function main(): Promise<void> {
     },
   });
 
-  // 绑定插件 TUI Slot API，允许插件控制 TUI 组件
+  // 构建 CommandCtx
+  const commandCtx: CommandCtx = {
+    agent,
+    chat,
+    config: userConfig,
+    model,
+    cwd,
+    allTools,
+    sessionMgr,
+    pluginRunner,
+  };
+
+  // 绑定插件 TUI Slot API
   pluginRunner.bindSlotAPI({
-    setHeader: (content, component) => content && chat.tui.requestRender(),
-    setFooter: (content, component) => content && chat.tui.requestRender(),
-    setWidget: (key, content, options) => content && chat.tui.requestRender(),
-    setStatus: (key, text) => {
+    setHeader: (_content, _component) => chat.tui.requestRender(),
+    setFooter: (_content, _component) => chat.tui.requestRender(),
+    setWidget: (_key, _content, _options) => chat.tui.requestRender(),
+    setStatus: (_key, text) => {
       if (text) chat.statusBar.modelLabel = text;
       chat.tui.requestRender();
     },
@@ -271,16 +270,15 @@ async function main(): Promise<void> {
     const cmd = text.trim();
     if (cmd === "") return;
 
-    // 处理命令
     if (cmd.startsWith("/")) {
       chat.inputBar.clear();
-      await handleCommand(cmd, { agent, chat, config: userConfig, model, cwd, allTools, sessionMgr, pluginRunner });
+      await commandRegistry.handleCommand(cmd, commandCtx);
       return;
     }
 
     chat.inputBar.clear();
     chat.setStatus("Streaming...", "streaming");
-    chat.updateMessages(agent.state.messages); // 展示用户消息
+    chat.updateMessages(agent.state.messages);
 
     agent.agentLoop(cmd)
       .then(() => {
@@ -292,7 +290,7 @@ async function main(): Promise<void> {
       });
   };
 
-  // 订阅 AI 流式输出 — 实时显示 AI 的增量内容
+  // 订阅 AI 流式输出
   agent.subscribe((event) => {
     switch (event.type) {
       case "message_update":
@@ -301,454 +299,27 @@ async function main(): Promise<void> {
         }
         break;
       case "turn_end":
-        // 整轮结束，重置流式状态并刷新
         chat.messageList.streamingMessage = null;
-        // 从 agent.state.messages 获取最新消息（含本轮 AI 回复和 tool 结果）
         chat.updateMessages(agent.state.messages);
-        // 额外重绘确保显示
         chat.tui.requestRender();
         break;
       case "agent_end":
-        // 确保所有消息已显示
         chat.updateMessages(agent.state.messages);
         chat.setStatus("Ready", "idle");
         chat.tui.requestRender();
-        // 自动保存到 session（链式调用，避免并发问题）
         sessionMgr.scheduleFlush(agent.state.messages);
         break;
       case "notification":
-        // 在 TUI 中显示通知
         if (event.level === "error") {
           chat.setStatus(event.message, "error");
         } else {
-          // info/warning 级别用 console.log 输出
           console.log(`\x1b[90m${event.message}\x1b[0m`);
         }
         break;
     }
   });
 
-  // 启动 TUI
   chat.tui.start();
-}
-
-// ============================================================================
-// 命令处理 — 参考 pi-mono 的 commands
-// ============================================================================
-
-interface CommandCtx {
-  agent: Agent;
-  chat: ChatTUI;
-  config: TCAConfig;
-  model: ModelConfig;
-  cwd: string;
-  allTools: AgentTool[];
-  sessionMgr: SessionManager;
-  pluginRunner: PluginRunner;
-}
-
-async function handleCommand(cmd: string, ctx: CommandCtx): Promise<void> {
-  const [name, ...args] = cmd.split(/\s+/);
-
-  switch (name) {
-    case "/exit":
-    case "/quit":
-      ctx.chat.stop();
-      process.exit(0);
-      return;
-
-    case "/help":
-    case "/?":
-      showHelp(ctx);
-      return;
-
-    case "/clear":
-      process.stdout.write("\x1b[2J\x1b[H");
-      return;
-
-    case "/model":
-      await handleModelCommand(args, ctx);
-      return;
-
-    case "/tokens":
-    case "/usage":
-      handleTokens(ctx);
-      return;
-
-    case "/ctx":
-      await handleCtxCommand(args, ctx);
-      return;
-
-    case "/compact":
-      await handleCompactCommand(args, ctx);
-      return;
-
-    case "/sessions":
-      await handleSessionsCommand(ctx);
-      return;
-
-    case "/session":
-      await handleSessionCommand(args, ctx);
-      return;
-
-    case "/tree":
-      handleTree(ctx);
-      return;
-
-    case "/fork":
-      await handleForkCommand(args, ctx);
-      return;
-
-    default:
-      // 尝试插件注册的命令（去掉 / 前缀）
-      const cmdName = name.startsWith("/") ? name.slice(1) : name;
-      if (await ctx.pluginRunner.executeCommand(cmdName, args.join(" "))) return;
-      ctx.chat.setStatus(`Unknown command: ${name}. Type /help`, "error");
-      setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
-  }
-}
-
-/** 构建命令选择面板的列表 */
-function buildCommandList(pluginRunner: PluginRunner): { name: string; description?: string }[] {
-  const builtinCmds: { name: string; description?: string }[] = [
-    { name: "exit", description: "Exit the application" },
-    { name: "help", description: "Show available commands" },
-    { name: "clear", description: "Clear screen" },
-    { name: "model", description: "Switch model: /model [provider:id]" },
-    { name: "tokens", description: "Show token usage" },
-    { name: "ctx", description: "Context overview" },
-    { name: "compact", description: "Compact conversation with LLM summary" },
-    { name: "sessions", description: "List all sessions" },
-    { name: "session", description: "Switch session: /session <id> | new" },
-    { name: "tree", description: "Show session tree" },
-    { name: "fork", description: "Fork session: /fork <entry-id>" },
-  ];
-  const pluginCmds = pluginRunner.getRegisteredCommands();
-  return [...builtinCmds, ...pluginCmds.map((c) => ({ name: c.name, description: c.description }))];
-}
-
-function showHelp(ctx: CommandCtx): void {
-  type styles = [string, string];
-  const hl = (s: string): string => `\x1b[33m${s}\x1b[0m`;  // yellow
-  const dim = (s: string): string => `\x1b[90m${s}\x1b[0m`; // gray
-
-  const lines = [
-    dim("── Commands ──────────────────────────────────────────────"),
-    `${hl("/help")}       ${dim("Show this help")}`,
-    `${hl("/clear")}      ${dim("Clear screen")}`,
-    `${hl("/model")}      ${dim("Switch model: /model <provider>:<id>")}`,
-    `${hl("/tokens")}     ${dim("Show estimated token usage")}`,
-    `${hl("/ctx")}        ${dim("Context usage overview")}`,
-    `${hl("/ctx compact")} ${dim("Trigger context compression")}`,
-    `${hl("/compact")}    ${dim("Compact with instructions: /compact <notes>")}`,
-    `${hl("/sessions")}   ${dim("List all sessions")}`,
-    `${hl("/session")}    ${dim("Switch session: /session <id>, /session new")}`,
-    `${hl("/tree")}       ${dim("Show session tree")}`,
-    `${hl("/fork")}       ${dim("Branch from a session entry: /fork <id>")}`,
-    `${hl("/exit")}       ${dim("Exit the agent")}`,
-    dim("────────────────────────────────────────────────────"),
-    `${dim("Model: " + (ctx.config.defaultModel ?? ctx.model.id))}`,
-  ];
-
-  const pluginCmds = ctx.pluginRunner.getRegisteredCommands();
-  if (pluginCmds.length > 0) {
-    lines.push(dim("── Plugin Commands ────────────────────────────────────────"));
-    for (const cmd of pluginCmds) {
-      lines.push(`${hl("/" + cmd.name)}     ${cmd.description ? dim(cmd.description) : ""}`);
-    }
-    lines.push(dim("────────────────────────────────────────────────────"));
-  }
-  console.log(lines.join("\n"));
-}
-
-async function handleModelCommand(args: string[], ctx: CommandCtx): Promise<void> {
-  const modelArg = args[0];
-  if (!modelArg) {
-    ctx.chat.setStatus(`Current model: ${ctx.model.id}`, "idle");
-    // 显示可用模型列表
-    const models = ctx.config.models ?? [];
-    if (models.length > 0) {
-      console.log(`\x1b[90mAvailable models:\x1b[0m`);
-      for (const m of models) {
-        console.log(`  \x1b[33m${m.provider}:${m.id}\x1b[0m${m.name ? ` \x1b[90m- ${m.name}\x1b[0m` : ""}`);
-      }
-    } else {
-      console.log(`\x1b[90m  No saved models. Use /model <provider>:<id> to switch.\x1b[0m`);
-    }
-    return;
-  }
-
-  // Parse provider:id
-  const colonIdx = modelArg.indexOf(":");
-  const provider = colonIdx >= 0 ? modelArg.slice(0, colonIdx) : ctx.model.provider;
-  const modelId = colonIdx >= 0 ? modelArg.slice(colonIdx + 1) : modelArg;
-
-  // 查找 config 中的匹配模型
-  const savedModel = ctx.config.models?.find(
-    (m) => m.id === modelId && m.provider === provider,
-  );
-
-  ctx.agent.model = {
-    id: modelId,
-    name: savedModel?.name ?? modelId,
-    provider,
-    apiKey: savedModel?.apiKey ?? ctx.model.apiKey,
-    baseURL: savedModel?.baseURL ?? ctx.model.baseURL,
-  };
-
-  ctx.chat.setModelLabel(modelId);
-  ctx.chat.setStatus(`Switched to ${provider}:${modelId}`, "idle");
-}
-
-function handleTokens(ctx: CommandCtx): void {
-  const usage = estimateContextUsage(
-    ctx.agent.state.messages,
-    ctx.agent.state.systemPrompt,
-    ctx.model.contextWindow ?? 128000,
-  );
-
-  const barWidth = 30;
-  const filled = Math.round((usage.percent / 100) * barWidth);
-  const bar = "\x1b[33m" + "█".repeat(filled) + "\x1b[90m" + "░".repeat(Math.max(0, barWidth - filled)) + "\x1b[0m";
-  const pct = usage.percent.toFixed(1);
-
-  console.log([
-    `\x1b[90m── Tokens ────────────────────────────\x1b[0m`,
-    `  ${bar}  ${pct}%`,
-    `  \x1b[2mTokens:\x1b[0m ${usage.tokens} / ${usage.limit}`,
-    `\x1b[90m──────────────────────────────────────\x1b[0m`,
-  ].join("\n"));
-}
-
-async function handleCtxCommand(args: string[], ctx: CommandCtx): Promise<void> {
-  const sub = args[0];
-
-  if (sub === "compact") {
-    await performCompact(ctx, "");
-    return;
-  }
-
-  // 默认显示上下文概览
-  const usage = estimateContextUsage(
-    ctx.agent.state.messages,
-    ctx.agent.state.systemPrompt,
-    ctx.model.contextWindow ?? 128000,
-  );
-
-  const barWidth = 30;
-  const filled = Math.round((usage.percent / 100) * barWidth);
-  const bar = "\x1b[33m" + "█".repeat(filled) + "\x1b[90m" + "░".repeat(Math.max(0, barWidth - filled)) + "\x1b[0m";
-  const pct = usage.percent.toFixed(1);
-
-  console.log([
-    `\x1b[90m── Context ────────────────────────────\x1b[0m`,
-    `  ${bar}  ${pct}%`,
-    `  \x1b[2mTokens:\x1b[0m ${usage.tokens} / ${usage.limit}`,
-    `  \x1b[2mMessages:\x1b[0m ${ctx.agent.state.messages.length}`,
-    `  \x1b[2mWindow:\x1b[0m ${ctx.model.id} (${usage.limit} tokens)`,
-    `\x1b[90m──────────────────────────────────────\x1b[0m`,
-    `\x1b[90mUse /ctx compact to compress.\x1b[0m`,
-  ].join("\n"));
-}
-
-async function handleCompactCommand(args: string[], ctx: CommandCtx): Promise<void> {
-  const instructions = args.join(" ") || "";
-  await performCompact(ctx, instructions);
-}
-
-async function performCompact(ctx: CommandCtx, _instructions: string): Promise<void> {
-  const messages = ctx.agent.state.messages;
-  if (messages.length === 0) {
-    console.log(`\x1b[90mNo messages to compact.\x1b[0m`);
-    return;
-  }
-
-  const cutPoint = findCutPoint(messages, 4000);
-  if (!cutPoint) {
-    console.log(`\x1b[90mContext is small enough, no compaction needed.\x1b[0m`);
-    return;
-  }
-
-  ctx.chat.setStatus(`Compacting ${cutPoint.truncatedCount} messages...`, "streaming");
-
-  try {
-    const messagesToSummarize = messages.slice(0, cutPoint.firstKeptIndex);
-    const prompt = buildCompactionPrompt({
-      messagesToSummarize,
-      keptMessages: messages.slice(cutPoint.firstKeptIndex),
-      instructions: _instructions || undefined,
-    });
-
-    // 直接调用 streamOpenAI 做压缩摘要
-    const llmMessages = await convertToLlm([
-      {
-        role: "user" as const,
-        content: [{ type: "text" as const, text: prompt }],
-        timestamp: Date.now(),
-      },
-    ]);
-
-    const stream = streamOpenAI(
-      ctx.model,
-      llmMessages,
-      "",
-      [],
-      { signal: ctx.agent.signal },
-    );
-
-    let summaryText = "[Compacted by LLM]\n";
-    
-    // 显示流式输出
-    process.stdout.write(`\x1b[90m── Compaction summary ───────────────────────\x1b[0m\n`);
-    for await (const event of stream) {
-      if (event.type === "text_delta") {
-        summaryText += event.delta ?? "";
-        process.stdout.write(event.delta ?? "");
-      }
-      if (event.type === "error") {
-        console.log(`\n\x1b[91mCompaction LLM error: ${event.error}\x1b[0m`);
-        return;
-      }
-    }
-    process.stdout.write(`\n`);
-
-    const compacted = buildCompactedMessages(messages, cutPoint, summaryText);
-    ctx.agent.setMessages(compacted);
-    ctx.chat.updateMessages(compacted);
-
-    // 持久化 CompactionEntry 到 session JSONL（参考 pi-mono 的 appendCompaction）
-    const summaryOffset = summaryOffsetOf(messages);
-    const firstKeptEntryId = ctx.sessionMgr.getEntryIdByMessageIndex(cutPoint.firstKeptIndex, summaryOffset);
-    if (firstKeptEntryId) {
-      const entry = createCompactionEntry(summaryText, cutPoint, firstKeptEntryId);
-      await ctx.sessionMgr.appendCompaction(entry);
-    }
-
-    ctx.chat.setStatus("Ready", "idle");
-    console.log(`\x1b[90mCompacted: ${messages.length} → ${compacted.length} messages with LLM summary\x1b[0m`);
-
-  } catch (err) {
-    ctx.chat.setStatus(`Compaction failed`, "error");
-    console.log(`\x1b[91mCompaction error: ${err instanceof Error ? err.message : String(err)}\x1b[0m`);
-    setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
-  }
-}
-
-async function handleSessionsCommand(ctx: CommandCtx): Promise<void> {
-  const sessions = await ctx.sessionMgr.listSessions();
-  if (sessions.length === 0) {
-    console.log(`\x1b[90mNo sessions found.\x1b[0m`);
-    return;
-  }
-
-  const items = sessions.map((s) => {
-    const name = s.meta.name ?? s.meta.id.slice(0, 12);
-    const date = new Date(s.meta.updatedAt).toLocaleString();
-    const marker = s.isCurrent ? "◀ current " : "";
-    return {
-      name: s.meta.id,
-      description: `${marker}${name}  ${date}  ${s.meta.messageCount} msgs`,
-    };
-  });
-
-  ctx.chat.showCommandPalette(items, {
-    onSelect: async (sessionId: string) => {
-      const target = sessions.find((s) => s.meta.id === sessionId);
-      if (!target) return;
-
-      ctx.chat.hideCommandPalette();
-      ctx.chat.setStatus(`Switching to session ${sessionId.slice(0, 12)}...`, "streaming");
-
-      try {
-        const messages = await ctx.sessionMgr.switchTo(target.meta.id);
-        ctx.agent.setMessages(messages);
-        ctx.chat.updateMessages(messages);
-        ctx.chat.setStatus(`Session: ${sessionId.slice(0, 12)}`, "idle");
-      } catch (err) {
-        ctx.chat.setStatus(`Failed to switch session: ${err}`, "error");
-        setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
-      }
-    },
-    onCancel: () => {
-      ctx.chat.hideCommandPalette();
-      ctx.chat.setStatus("Ready", "idle");
-    },
-  });
-}
-
-async function handleSessionCommand(args: string[], ctx: CommandCtx): Promise<void> {
-  const sub = args[0];
-
-  if (!sub) {
-    console.log(`Current session: \x1b[33m${ctx.sessionMgr.sessionId.slice(0, 12)}\x1b[0m`);
-    return;
-  }
-
-  if (sub === "new") {
-    await ctx.sessionMgr.createNew();
-    ctx.agent.setMessages([]);
-    ctx.chat.setStatus("New session created", "idle");
-    ctx.chat.updateMessages([]);
-    console.log(`\x1b[90mSession context cleared.\x1b[0m`);
-    return;
-  }
-
-  // 查找 session（支持部分匹配）
-  const sessions = await ctx.sessionMgr.listSessions();
-  const target = sessions.find((s) => s.meta.id.startsWith(sub));
-  if (!target) {
-    ctx.chat.setStatus(`Session not found: ${sub}`, "error");
-    setTimeout(() => ctx.chat.setStatus("Ready", "idle"), 2000);
-    return;
-  }
-
-  // 切换到目标 session
-  const messages = await ctx.sessionMgr.switchTo(target.meta.id);
-  ctx.agent.setMessages(messages);
-  ctx.chat.updateMessages(messages);
-  ctx.chat.setStatus(`Switched to session ${target.meta.id.slice(0, 12)} (${messages.length} msgs)`, "idle");
-}
-
-function handleTree(ctx: CommandCtx): void {
-  const tree = ctx.sessionMgr.renderTree();
-  if (!tree) {
-    console.log(`\x1b[90mSession is empty.\x1b[0m`);
-    return;
-  }
-  console.log(`\x1b[90m── Session tree ─────────────────────────\x1b[0m`);
-  console.log(tree);
-}
-
-async function handleForkCommand(args: string[], ctx: CommandCtx): Promise<void> {
-  if (!args[0]) {
-    console.log(`\x1b[33mUsage: /fork <entry-id>\x1b[0m`);
-    return;
-  }
-
-  const entryId = args[0];
-  const entry = ctx.sessionMgr.getEntryById(entryId);
-  if (!entry) {
-    console.log(`\x1b[91mEntry not found: ${entryId}\x1b[0m`);
-    return;
-  }
-
-  ctx.chat.setStatus(`Forking from ${entryId.slice(0, 8)}...`, "streaming");
-
-  // fork 以一条新的 user 消息表示
-  const branchNote = args.slice(1).join(" ") || "fork branch";
-  const forkMsg: AgentMessage = {
-    role: "user",
-    content: [{ type: "text", text: `[Fork: ${branchNote}] Continue from here` }],
-    timestamp: Date.now(),
-  };
-
-  const newId = await ctx.sessionMgr.forkFrom(entryId, forkMsg);
-
-  // 重建上下文：从 fork 点往后的消息
-  const messages = ctx.sessionMgr.branchMessages;
-  ctx.agent.setMessages(messages);
-  ctx.chat.updateMessages(messages);
-  ctx.chat.setStatus(`Forked from ${entryId.slice(0, 8)} (session: ${ctx.sessionMgr.sessionId.slice(0, 12)})`, "idle");
 }
 
 main().catch((err) => {
