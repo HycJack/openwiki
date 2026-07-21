@@ -16,7 +16,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
     "esbuild": "npx esbuild src/cli.ts --bundle --platform=node --outfile=dist/cli.js",
-    "test": "npx tsx --test \"test/*.test.ts\""
+    "test": "npx tsx --test \"test/*.test.ts\"",
+    "build:sandbox": "node scripts/build-sandbox-helper.mjs",
+    "ensure:sandbox": "node scripts/ensure-sandbox-helper.mjs"
   },
   "keywords": [
     "tui",

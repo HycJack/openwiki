@@ -36,6 +36,10 @@ export interface TCAConfig {
   tools?: string[];
   /** 自定义系统提示 */
   systemPrompt?: string;
+  /** 工作目录（沙箱内可写，不配置则默认 home） */
+  workspace?: string;
+  /** 是否启用 Windows 沙箱 */
+  sandboxEnabled?: boolean;
 }
 
 const CONFIG_PATH = path.join(os.homedir(), ".tca", "config.json");

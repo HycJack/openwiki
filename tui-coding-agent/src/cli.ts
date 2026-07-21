@@ -31,6 +31,10 @@ import {
 } from "./compaction.js";
 import type { AgentTool, ModelConfig, TextContent } from "./types.js";
 import { CommandRegistry, registerAllCommands, type CommandCtx, type CliArgs } from "./commands/index.js";
+import { getSandbox } from "./sandbox/index.js";
+import * as os from "node:os";
+
+const IS_WIN = process.platform === "win32";
 
 // ============================================================================
 // 参数解析
@@ -125,6 +129,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // 解析工作目录和沙箱配置
+  const workspace = userConfig.workspace ?? os.homedir();
+  const sandboxEnabled = userConfig.sandboxEnabled !== false; // 默认启用
+
+  // 初始化沙箱
+  const sandbox = getSandbox();
+  if (sandboxEnabled && IS_WIN) {
+    sandbox.init(workspace);
+    if (sandbox.isActive) {
+      console.log(`[sandbox] Windows sandbox enabled. Workspace: ${workspace}`);
+    }
+  } else if (!IS_WIN) {
+    console.log(`[sandbox] Windows sandbox only available on Windows.`);
+  }
+
   // 加载插件
   const pluginRuntime = createPluginRuntime();
   const pluginPaths = [
@@ -137,15 +156,21 @@ async function main(): Promise<void> {
     console.error(`Plugin load error: ${err.path}: ${err.error}`);
   }
 
-  // 构建工具
-  const builtinTools = createBuiltinTools();
+  // 构建工具（传入沙箱）
+  const builtinTools = createBuiltinTools(sandbox.isActive ? sandbox : undefined);
   const pluginTools = loadResult.plugins.flatMap((p) => Array.from(p.tools.values()));
   const toolMap = new Map<string, AgentTool>();
   for (const tool of builtinTools) toolMap.set(tool.name, tool);
   for (const tool of pluginTools) { if (!toolMap.has(tool.name)) toolMap.set(tool.name, tool); }
   const allTools = Array.from(toolMap.values());
 
-  const systemPrompt = buildSystemPrompt({ cwd, tools: allTools });
+  const systemPrompt = buildSystemPrompt({
+    cwd,
+    tools: allTools,
+    customInstructions: sandbox.isActive
+      ? `\n## Sandbox restrictions\n- This environment is running inside a Windows sandbox.\n- Writable workspace: ${workspace}\n- Commands can only write to the workspace directory.`
+      : undefined,
+  });
 
   // 创建插件 runner
   const pluginRunner = createPluginRunner(loadResult, pluginRuntime, { cwd, model, systemPrompt });

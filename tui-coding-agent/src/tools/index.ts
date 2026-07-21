@@ -14,7 +14,9 @@ import { Type, type Static } from "typebox";
 import { execFile, execSync } from "node:child_process";
 import { readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import type { AgentTool } from "../types.js";
+import type { SandboxManager } from "../sandbox/index.js";
 
 const MAX_OUTPUT = 100_000;
 
@@ -66,18 +68,37 @@ const LsParams = Type.Object({
   path: Type.Optional(Type.String({ description: "Directory path (default cwd)" })),
 });
 
-export function createBashTool(): AgentTool<typeof BashParams> {
+export function createBashTool(sandbox?: SandboxManager): AgentTool<typeof BashParams> {
   const shellName = IS_WIN ? (hasPwsh() ? "PowerShell (pwsh)" : "cmd.exe") : "/bin/bash";
   return {
     name: "bash",
     label: "Bash",
-    description: `Execute a ${shellName} command and return stdout/stderr. Running on ${OS_NAME}.`,
+    description: `Execute a ${shellName} command and return stdout/stderr. Running on ${OS_NAME}.${sandbox?.isActive ? " [sandboxed]" : ""}`,
     parameters: BashParams,
     executionMode: "sequential",
     execute: async (_toolCallId, params, signal) => {
       const cwd = params.cwd ?? process.cwd();
       const timeout = (params.timeout ?? 120) * 1000;
 
+      // 沙箱激活时走沙箱路径
+      if (sandbox?.isActive) {
+        const sbResult = await sandbox.run(
+          IS_WIN ? (params.isPowerShell ? "pwsh.exe" : "cmd.exe") : "/bin/bash",
+          IS_WIN
+            ? (params.isPowerShell || hasPwsh()
+              ? ["-NoLogo", "-NonInteractive", "-Command", params.command]
+              : ["/c", params.command])
+            : ["-c", params.command],
+          { cwd, timeoutMs: timeout },
+        );
+
+        return {
+          content: [{ type: "text", text: sbResult.stdout + sbResult.stderr || "(no output)" }],
+          details: { exitCode: sbResult.exitCode, stdout: sbResult.stdout, stderr: sbResult.stderr, sandboxed: true },
+        };
+      }
+
+      // 非沙箱路径（原有逻辑）
       return new Promise((resolve) => {
         let shell: string;
         let shellArgs: string[];
@@ -309,9 +330,9 @@ function matchGlob(filename: string, pattern: string): boolean {
   return new RegExp(`^${regexPattern}$`).test(filename);
 }
 
-export function createBuiltinTools(): AgentTool[] {
+export function createBuiltinTools(sandbox?: SandboxManager): AgentTool[] {
   return [
-    createBashTool() as AgentTool,
+    createBashTool(sandbox) as AgentTool,
     createReadTool() as AgentTool,
     createWriteTool() as AgentTool,
     createEditTool() as AgentTool,

@@ -44,12 +44,14 @@ describe("createPluginRuntime", () => {
 });
 
 describe("loadPlugin (basic validation)", () => {
-  it("加载不存在的文件不崩溃", async () => {
+  it("加载不存在的文件返回 error", async () => {
     const runtime = createPluginRuntime();
     const result = await loadPlugin("/nonexistent/path.ts", "/cwd", runtime);
-    // 返回值应有 errors 数组（即使为空）或 plugins 数组
-    assert(Array.isArray(result.errors));
-    assert(Array.isArray(result.plugins));
+    // 文件不存在，应该返回 error 而 plugin 为 null
+    assert(result.error !== null || result.plugin === null);
+    if (result.error) {
+      assert(typeof result.error === "string");
+    }
   });
 
   it("加载不导出默认函数的插件（语法错误）", async () => {

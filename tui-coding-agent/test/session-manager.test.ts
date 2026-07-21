@@ -126,9 +126,9 @@ describe("SessionManager", () => {
   // getEntryIdByMessageIndex
   // ==========================================================================
 
-  it("getEntryIdByMessageIndex 返回 undefined（无 entry 时）", () => {
+  it("getEntryIdByMessageIndex 返回 null（无 entry 时）", () => {
     const id = mgr.getEntryIdByMessageIndex(0, 0);
-    assert.equal(id, undefined);
+    assert.equal(id, null);
   });
 
   it("setMessages 存储消息引用", () => {

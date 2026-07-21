@@ -94,5 +94,9 @@ export type {
 export { createChatTUI, MessageList, TitleBar, Footer, InputBar } from "./tui/index.js";
 export type { ChatTUI, StatusType } from "./tui/index.js";
 
+// Sandbox (Windows)
+export { SandboxManager, getSandbox, resetSandbox } from "./sandbox/index.js";
+export type { SandboxResult } from "./sandbox/index.js";
+
 // Types
 export type * from "./types.js";
