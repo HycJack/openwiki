@@ -17,20 +17,16 @@ defaults:
 
 jobs:
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: ["22.19.0"]
-
-    runs-on: ${{ matrix.os }}
+    # 暂时只跑 windows-latest（macos/ubuntu Node.js 20 弃用问题待修复）
+    runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: "22.19.0"
           cache: npm
           cache-dependency-path: 'tui-coding-agent/package-lock.json'
 
@@ -49,10 +45,10 @@ jobs:
     needs: test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22.19.0"
           cache: npm
